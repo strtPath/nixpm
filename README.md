@@ -165,7 +165,7 @@ NIXPM_RESTART_MENU="auto"
 
 - [Nix](https://nixos.org/download/) package manager (multi-user mode recommended)
 - Bash 4.0+
-- `jq` (used for pretty `info` output)
+- `jq` (optional — pretty-prints `info` output; without it, `info` shows the raw JSON)
 
 ---
 

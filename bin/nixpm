@@ -169,7 +169,36 @@ cmd_search() {
   [[ -z "$query" ]] && die "Usage: nixpm search <query>"
   out "Searching nixpkgs for '${query}'..."
 
-  _nix_x search "$NIXPM_NIXPKGS" "$query" 2>/dev/null | \
+  local errfile
+  errfile="$(mktemp)" || die "Failed to create a temporary file."
+
+  # Capture nix output and its exit status separately: a failed nix run must
+  # be reported, never masqueraded as "no matches".
+  local raw rc=0
+  raw="$(_nix_x search "$NIXPM_NIXPKGS" "$query" 2>"$errfile")" || rc=$?
+
+  # "No matches" on its own: nix exits 0 (or 1 on newer versions with an
+  # "error: no results ..." note) and prints nothing to stdout.
+  if [[ -z "$raw" ]] && { [[ $rc -eq 0 ]] || grep -q "no results for the given search term" "$errfile"; }; then
+    rm -f "$errfile"
+    warn "No packages in '${NIXPM_NIXPKGS}' match '${query}'."
+    exit 1
+  fi
+
+  if [[ $rc -ne 0 ]]; then
+    err "nix search failed (exit $rc):"
+    if [[ -s "$errfile" ]]; then
+      # Drop per-attribute progress noise, keep the actual diagnostics.
+      grep -v "^[[:space:]]*evaluating " "$errfile" | sed 's/^/  /' | tail -20 >&2
+    else
+      info "(nix printed no diagnostics)"
+    fi
+    rm -f "$errfile"
+    exit 1
+  fi
+  rm -f "$errfile"
+
+  printf '%s\n' "$raw" | \
     sed -E 's/\x1b\[[0-9;]*m//g' | \
     sed -E 's/^\* legacyPackages\.[a-zA-Z0-9_-]+\./* /' | \
     awk '
@@ -262,24 +291,51 @@ cmd_info() {
   [[ -z "$pkg" ]] && die "Usage: nixpm info <pkg>"
   out "Metadata for ${C_B}${pkg}${C_RST}:"
 
-  local meta=""
-  if meta=$(_nix_x eval --json "${NIXPM_NIXPKGS}#${pkg}.meta" 2>/dev/null); then
-    echo "$meta" | jq -r '(
-      "Name:        \(.name // .pname // "?")",
-      "Description: \(.description // "—")",
-      "Homepage:    \(.homepage // "—")",
-      "License:     \(.license.spdxId // .license.fullName // .license.shortName // "—")",
-      "Shell hook:  \(.hasShellHook // false)",
-      "Main program:\(.mainProgram // "—")"
-    )' 2>/dev/null || echo "$meta"
+  local meta="" errfile
+  errfile="$(mktemp)" || die "Failed to create a temporary file."
+
+  # Two equivalent ways to reach the metadata, covering both setup styles:
+  #   1) flake reference   — flakes-only / flake-registry systems
+  #   2) channel import    — traditional channel systems
+  # The first one that evaluates wins.
+  if ! meta=$(_nix_x eval --json "${NIXPM_NIXPKGS}#${pkg}.meta" 2>"$errfile"); then
+    if ! meta=$(_nix_x eval --json --impure \
+                   --expr "(import <${NIXPM_NIXPKGS}> {}).${pkg}.meta" 2>>"$errfile"); then
+      meta=""
+    fi
+  fi
+
+  if [[ -n "$meta" ]]; then
+    if has_cmd jq; then
+      printf '%s\n' "$meta" | jq -r '(
+        "Name:        \(.name // .pname // "?")",
+        "Description: \(.description // "—")",
+        "Homepage:    \(.homepage // "—")",
+        "License:     \(.license.spdxId // .license.fullName // .license.shortName // "—")",
+        "Shell hook:  \(.hasShellHook // false)",
+        "Main program: \(.mainProgram // "—")"
+      )' 2>/dev/null || printf '%s\n' "$meta"
+    else
+      warn "jq not found — showing raw JSON metadata."
+      printf '%s\n' "$meta"
+    fi
+    rm -f "$errfile"
     return 0
   fi
 
-  # Fallback to nix-env JSON
-  local outpath outname
-  outpath=$(nix-env -qaA "${NIXPM_NIXPKGS}.${pkg}" --json 2>/dev/null) || die "Package '${pkg}' not found."
-  outname=$(echo "$outpath" | jq -r 'keys[0]')
-  echo "$outpath" | jq -r ". \"\" | [\"Name:        \(.name // .pname // \"?\")\", \"Description: \(.description // \"—\")\"] | .[]"
+  # Last resort: verify existence without any version-specific flags, so a
+  # package is never reported "not found" while it is actually available.
+  local avail
+  if ! avail=$(nix-env -qaA "${NIXPM_NIXPKGS}.${pkg}" 2>/dev/null) || [[ -z "$avail" ]]; then
+    rm -f "$errfile"
+    die "Package '${pkg}' not found in '${NIXPM_NIXPKGS}'."
+  fi
+  warn "Package exists, but its metadata could not be evaluated."
+  if [[ -s "$errfile" ]]; then
+    head -n 1 "$errfile" | sed 's/^/  /'
+  fi
+  printf '%s\n' "$avail" | head -5 | sed 's/^/  /'
+  rm -f "$errfile"
 }
 
 cmd_apps() {
