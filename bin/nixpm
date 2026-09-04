@@ -12,7 +12,7 @@
 #
 # Config:       ~/.config/nixpm/config  (sourced, optional)
 #
-# Project:      https://github.com/yourname/nixpm
+# Project:      https://github.com/strtPath/nixpm
 # License:      MIT
 
 set -euo pipefail

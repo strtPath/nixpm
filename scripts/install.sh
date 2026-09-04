@@ -5,8 +5,8 @@
 
 set -euo pipefail
 
-REPO="https://github.com/YOURUSER/nixpm"
-RAW="https://raw.githubusercontent.com/YOURUSER/nixpm/main/bin/nixpm"
+REPO="https://github.com/strtPath/nixpm"
+RAW="https://raw.githubusercontent.com/strtPath/nixpm/main/bin/nixpm"
 DESTDIR="${PREFIX:-${HOME}/.local}/bin"
 
 main() {

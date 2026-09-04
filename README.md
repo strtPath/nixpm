@@ -19,16 +19,16 @@ A tiny, friendly package-manager wrapper around [Nix](https://nixos.org/). Inspi
 
 ### Quick (curl)
 
-> ⚠️ Replace `YOURUSER` with your GitHub username after forking/uploading.
+> ⚠️ Hosted at `strtPath/nixpm`.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOURUSER/nixpm/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/strtPath/nixpm/main/scripts/install.sh | bash
 ```
 
 ### Manual
 
 ```bash
-git clone https://github.com/YOURUSER/nixpm.git
+git clone https://github.com/strtPath/nixpm.git
 cd nixpm
 make install        # copies to ~/.local/bin
 ```
