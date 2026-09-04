@@ -1,0 +1,13 @@
+# Nix store references
+result
+result-*
+
+# Editor droppings
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# macOS
+.DS_Store

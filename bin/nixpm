@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+#
+# nixpm — Tiny Nix package manager wrapper with optional desktop integration
+#
+# A friendly frontend to nix-env inspired by pacman / brew.
+# Works on any Linux/macOS system with Nix installed.
+# Optionally reloads desktop launchers after install/remove so new apps
+# appear right away (Omarchy, Hyprland, etc.).
+#
+# Install:      cp bin/nixpm ~/.local/bin/
+#               chmod +x ~/.local/bin/nixpm
+#
+# Config:       ~/.config/nixpm/config  (sourced, optional)
+#
+# Project:      https://github.com/yourname/nixpm
+# License:      MIT
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Hardcoded globals (override via config or env)
+# ---------------------------------------------------------------------------
+readonly NIXPM_VERSION="0.1.0"
+
+# ---------------------------------------------------------------------------
+# Configuration (sourced from file, optional)
+# ---------------------------------------------------------------------------
+: "${XDG_CONFIG_HOME:=${HOME}/.config}"
+NIXPM_CONFIG="${XDG_CONFIG_HOME}/nixpm/config"
+[[ -f "$NIXPM_CONFIG" ]] && source "$NIXPM_CONFIG"
+
+NIXPM_NIXPKGS="${NIXPM_NIXPKGS:-nixpkgs}"
+# true|false|auto  (auto=restart only if a supported DE/WM is detected)
+NIXPM_RESTART_MENU="${NIXPM_RESTART_MENU:-auto}"
+
+# ---------------------------------------------------------------------------
+# Terminal colors
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+  C_B=$'\033[1m'; C_GRN=$'\033[32m'; C_RED=$'\033[31m'; C_YEL=$'\033[33m'
+  C_BLU=$'\033[34m'; C_CYN=$'\033[36m'; C_RST=$'\033[0m'
+else
+  C_B=""; C_GRN=""; C_RED=""; C_YEL=""; C_BLU=""; C_CYN=""; C_RST=""
+fi
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+out()    { printf "${C_BLU}%s${C_RST} %s\n" "==>" "$*"; }
+ok()     { printf "${C_GRN}%s${C_RST} %s\n" "==>" "$*"; }
+warn()   { printf "${C_YEL}%s${C_RST} %s\n" "=>" "$*" >&2; }
+err()    { printf "${C_RED}%s${C_RST} %s\n" "==>" "$*" >&2; }
+info()   { printf "  %s\n" "$*"; }
+die()    { err "$*"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Primitives
+# ---------------------------------------------------------------------------
+has_cmd()       { command -v "$1" >/dev/null 2>&1; }
+is_running()    { pgrep -x "$1" >/dev/null 2>&1; }
+xdg_conf_dir()  { printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+
+# ---------------------------------------------------------------------------
+# Desktop-session detection & reload helpers
+# ---------------------------------------------------------------------------
+
+# Print a one-liner telling the user how to make .desktop files visible.
+_reload_hint_text() {
+  cat <<'EOF'
+Some Nix packages ship .desktop files. Desktop launchers need one of:
+  1) Log out and back in, or
+  2) Restart your desktop shell / panel / launcher (see README).
+EOF
+}
+
+# Attempt to reload the active session so new .desktop files are picked up.
+# Returns 0 if any action was taken, 1 otherwise.
+_reload_session() {
+  if [[ "$NIXPM_RESTART_MENU" == "false" ]]; then
+    return 1
+  fi
+
+  local auto=false
+  [[ "$NIXPM_RESTART_MENU" == "auto" ]] && auto=true
+
+  # 1) Omarchy (Hyprland + Quickshell)
+  if has_cmd omarchy && is_running Hyprland; then
+    if $auto || [[ "$NIXPM_RESTART_MENU" == "true" ]]; then
+      out "Restarting Omarchy shell to refresh the app menu..."
+      if omarchy restart shell 2>/dev/null; then
+        ok "Omarchy shell restarted."
+        return 0
+      else
+        warn "Shell restart failed (maybe busy/locked)."
+      fi
+    fi
+    return 1
+  fi
+
+  # 2) Plain Hyprland (no Omarchy)
+  if is_running Hyprland && has_cmd hyprctl; then
+    if $auto || [[ "$NIXPM_RESTART_MENU" == "true" ]]; then
+      out "Reloading Hyprland to pick up new environment..."
+      if hyprctl reload 2>/dev/null; then
+        ok "Hyprland reloaded."
+        info "You may still need to restart your launcher (waybar, rofi, wofi, etc.)."
+        return 0
+      fi
+    fi
+    return 1
+  fi
+
+  # 3) GNOME / Mutter
+  if is_running gnome-shell && has_cmd gsettings; then
+    # There's no reliable GNOME "reload" — logging out is the only way
+    return 1
+  fi
+
+  # 4) KDE Plasma
+  if is_running plasmashell && has_cmd kbuildsycoca6; then
+    if $auto || [[ "$NIXPM_RESTART_MENU" == "true" ]]; then
+      out "Rebuilding Plasma application database..."
+      kbuildsycoca6 2>/dev/null && ok "Done." && return 0
+    fi
+    return 1
+  fi
+
+  # 5) Sway
+  if is_running sway && has_cmd swaymsg; then
+    if $auto || [[ "$NIXPM_RESTART_MENU" == "true" ]]; then
+      out "Reloading Sway..."
+      swaymsg reload 2>/dev/null && return 0
+    fi
+    return 1
+  fi
+
+  # If auto mode and nothing matched, stay silent and return 1.
+  # If true mode and nothing matched, warn.
+  if [[ "$NIXPM_RESTART_MENU" == "true" ]]; then
+    warn "Could not detect a supported desktop session to reload."
+  fi
+  return 1
+}
+
+# Wrapper used after install / remove. Always shows a hint if reload was skipped.
+_post_install_reload() {
+  if ! _reload_session; then
+    _reload_hint_text
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Nix helpers
+# ---------------------------------------------------------------------------
+
+# Run a nix subcommand with the common experimental features enabled.
+_nix_x() {
+  nix --extra-experimental-features nix-command \
+      --extra-experimental-features flakes "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_search() {
+  local query
+  query="${1:-}"
+  [[ -z "$query" ]] && die "Usage: nixpm search <query>"
+  out "Searching nixpkgs for '${query}'..."
+
+  _nix_x search "$NIXPM_NIXPKGS" "$query" 2>/dev/null | \
+    sed -E 's/\x1b\[[0-9;]*m//g' | \
+    sed -E 's/^\* legacyPackages\.[a-zA-Z0-9_-]+\./* /' | \
+    awk '
+      BEGIN { pkg=""; desc=""; has_pkg=0 }
+      /^\* / {
+        if (has_pkg) print_entry()
+        pkg = $0; sub(/^\* /, "", pkg)
+        desc = ""; has_pkg = 1; next
+      }
+      /^  / { sub(/^  /, ""); desc = (desc=="" ? $0 : desc " " $0); next }
+      { if (has_pkg) desc = desc " " $0 }
+      END { if (has_pkg) print_entry() }
+      function print_entry() {
+        if (length(desc) > 110) desc = substr(desc, 1, 107) "..."
+        printf "%s\n  %s\n", pkg, desc
+      }
+    ' | head -50
+}
+
+cmd_install() {
+  [[ $# -eq 0 ]] && die "Usage: nixpm install <pkg> [pkg...]"
+  for pkg in "$@"; do
+    out "Installing ${C_B}${pkg}${C_RST} from ${NIXPM_NIXPKGS}..."
+    nix-env -iA "${NIXPM_NIXPKGS}.${pkg}"
+    ok "Installed ${pkg}."
+  done
+  _post_install_reload
+}
+
+cmd_remove() {
+  [[ $# -eq 0 ]] && die "Usage: nixpm remove <pkg> [pkg...]"
+  for pkg in "$@"; do
+    out "Removing ${C_B}${pkg}${C_RST}..."
+    nix-env -e "$pkg"
+    ok "Removed ${pkg}."
+  done
+  _post_install_reload
+}
+
+cmd_list() {
+  out "Installed Nix packages:"
+  nix-env -q
+}
+
+cmd_list_derivations() {
+  out "Installed packages with store paths:"
+  nix-env -q --out-path
+}
+
+cmd_update() {
+  out "Updating Nix channels..."
+  if nix-channel --update 2>/dev/null; then
+    ok "Channels updated."
+    return 0
+  fi
+
+  warn "nix-channel --update failed (maybe using flakes?)."
+  if has_cmd nix && _nix_x flake update 2>/dev/null; then
+    ok "Flake inputs updated."
+    return 0
+  fi
+
+  warn "No traditional channels or flakes registry found to update."
+}
+
+cmd_upgrade() {
+  if [[ $# -eq 0 ]]; then
+    out "Upgrading all installed packages..."
+    nix-env -u
+  else
+    for pkg in "$@"; do
+      out "Upgrading ${pkg}..."
+      nix-env -u "$pkg"
+    done
+  fi
+  _post_install_reload
+}
+
+cmd_shell() {
+  [[ $# -eq 0 ]] && die "Usage: nixpm shell <pkg> [pkg...]"
+  local pkgs=()
+  for p in "$@"; do pkgs+=("-p" "$p"); done
+  out "Entering Nix shell with: ${C_B}$*${C_RST}"
+  nix-shell "${pkgs[@]}"
+}
+
+cmd_info() {
+  local pkg
+  pkg="${1:-}"
+  [[ -z "$pkg" ]] && die "Usage: nixpm info <pkg>"
+  out "Metadata for ${C_B}${pkg}${C_RST}:"
+
+  local meta=""
+  if meta=$(_nix_x eval --json "${NIXPM_NIXPKGS}#${pkg}.meta" 2>/dev/null); then
+    echo "$meta" | jq -r '(
+      "Name:        \(.name // .pname // "?")",
+      "Description: \(.description // "—")",
+      "Homepage:    \(.homepage // "—")",
+      "License:     \(.license.spdxId // .license.fullName // .license.shortName // "—")",
+      "Shell hook:  \(.hasShellHook // false)",
+      "Main program:\(.mainProgram // "—")"
+    )' 2>/dev/null || echo "$meta"
+    return 0
+  fi
+
+  # Fallback to nix-env JSON
+  local outpath outname
+  outpath=$(nix-env -qaA "${NIXPM_NIXPKGS}.${pkg}" --json 2>/dev/null) || die "Package '${pkg}' not found."
+  outname=$(echo "$outpath" | jq -r 'keys[0]')
+  echo "$outpath" | jq -r ". \"\" | [\"Name:        \(.name // .pname // \"?\")\", \"Description: \(.description // \"—\")\"] | .[]"
+}
+
+cmd_apps() {
+  out "Installed packages with .desktop files:"
+  local found=0
+
+  while IFS= read -r line; do
+    local pkg outpath appdir dfiles
+    pkg=${line%%[$' \t']*}
+    # Trim leading whitespace to get the store path
+    outpath="${line#*[$' \t']}"
+    outpath="${outpath#"${outpath%%[![:space:]]*}"}"
+    appdir="${outpath}/share/applications"
+    [[ -d "$appdir" ]] || continue
+
+    dfiles=$(find "$appdir" -maxdepth 1 -name "*.desktop" -print0 2>/dev/null | \
+             tr '\0' '\n' | head -n 5)
+    [[ -n "$dfiles" ]] || continue
+
+    found=$((found + 1))
+    printf "%b%s%b\n" "$C_B" "$pkg" "$C_RST"
+    while IFS= read -r df; do
+      [[ -n "$df" ]] && printf "  %s\n" "$(basename "$df")"
+    done <<< "$dfiles"
+  done < <(nix-env -q --out-path 2>/dev/null)
+
+  if [[ $found -eq 0 ]]; then
+    warn "No installed Nix packages ship .desktop files."
+    info "They may still be available as CLI tools."
+  fi
+}
+
+cmd_restart_menu() {
+  if ! _reload_session; then
+    die "Could not reload the desktop session."
+  fi
+}
+
+cmd_version() {
+  printf "nixpm %s\n" "$NIXPM_VERSION"
+}
+
+cmd_help() {
+  cat <<EOF
+${C_B}nixpm${C_RST} — a tiny package-manager wrapper around Nix
+
+${C_B}Usage:${C_RST} nixpm <command> [args...]
+
+${C_B}Commands:${C_RST}
+  search  <query>              Search nixpkgs
+  install <pkg> [pkg...]       Install package(s)
+  remove  <pkg> [pkg...]       Uninstall package(s)
+  list                         List installed packages
+  list-derivations             List installed packages with store paths
+  update                       Update channels / flake inputs
+  upgrade [pkg...]             Upgrade all (or specific) packages
+  shell   <pkg> [pkg...]       Enter a nix-shell with package(s)
+  info    <pkg>                Show package metadata
+  apps                         List installed packages with .desktop files
+  restart-menu                 Reload the desktop session / app menu
+  version, --version, -V       Show version
+  help,    --help,    -h       Show this help
+
+${C_B}Configuration:${C_RST} ~/.config/nixpm/config (bash-sourced)
+  NIXPM_NIXPKGS="nixpkgs"       # Nixpkgs attribute path (or channel name)
+  NIXPM_RESTART_MENU="auto"     # true | false | auto
+
+${C_B}Notes:${C_RST}
+  * "auto" (default) restarts the session only when a supported DE/WM
+    (Omarchy, Hyprland, Sway, KDE Plasma) is detected.
+  * On unsupported desktops you may need to log out and back in for
+    .desktop files to become visible.
+
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+  if ! has_cmd nix; then
+    die "Nix is not installed or not on PATH.\nSee https://nixos.org/download/"
+  fi
+
+  # Parse global flags
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)    cmd_help; exit 0 ;;
+      -V|--version) cmd_version; exit 0 ;;
+      --no-restart) NIXPM_RESTART_MENU="false"; shift ;;
+      --) shift; break ;;
+      -*) die "Unknown flag: $1" ;;
+      *) break ;;
+    esac
+  done
+
+  [[ $# -eq 0 ]] && { cmd_help; exit 1; }
+
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    search|S)              cmd_search "$@" ;;
+    install|i)             cmd_install "$@" ;;
+    remove|uninstall|rm)   cmd_remove "$@" ;;
+    list|ls|Q)             cmd_list ;;
+    list-derivations|ld)   cmd_list_derivations ;;
+    update|u)              cmd_update ;;
+    upgrade|U)             cmd_upgrade "$@" ;;
+    shell|s)               cmd_shell "$@" ;;
+    info|I)                cmd_info "$@" ;;
+    apps)                  cmd_apps ;;
+    restart-menu|refresh)  cmd_restart_menu ;;
+    version|--version|-V)  cmd_version ;;
+    help|--help|-h)        cmd_help ;;
+    *)                     die "Unknown command: $cmd. Run 'nixpm help' for usage." ;;
+  esac
+}
+
+main "$@"
