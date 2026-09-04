@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # nixpm installer
-# Install:   curl -fsSL https://raw.githubusercontent.com/YOURUSER/nixpm/main/install.sh | bash
+# Install:   curl -fsSL https://raw.githubusercontent.com/strtPath/nixpm/main/install.sh | bash
 # Uninstall: rm ~/.local/bin/nixpm
 
 set -euo pipefail
