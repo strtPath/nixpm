@@ -20,7 +20,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Hardcoded globals (override via config or env)
 # ---------------------------------------------------------------------------
-readonly NIXPM_VERSION="0.1.0"
+readonly NIXPM_VERSION="0.2.0"
 
 # ---------------------------------------------------------------------------
 # Configuration (sourced from file, optional)
@@ -248,23 +248,39 @@ cmd_list_derivations() {
   nix-env -q --out-path
 }
 
-cmd_update() {
-  out "Updating Nix channels..."
+# Refresh the package source (traditional channels first, flakes as a
+# fallback). `nix-env` only ever sees the snapshot that is already fetched,
+# so refresh must happen before upgrade/install can see newer versions.
+_update_index() {
+  out "Refreshing package index..."
   if nix-channel --update 2>/dev/null; then
     ok "Channels updated."
     return 0
   fi
 
   warn "nix-channel --update failed (maybe using flakes?)."
-  if has_cmd nix && _nix_x flake update 2>/dev/null; then
+  # Only touch a flake lock when we're actually inside a flake project —
+  # never go wandering up parent directories and rewrite someone's
+  # flake.lock just because an upgrade was run from there.
+  if [[ -f flake.nix || -f flake.lock ]] && has_cmd nix && _nix_x flake update 2>/dev/null; then
     ok "Flake inputs updated."
     return 0
   fi
 
   warn "No traditional channels or flakes registry found to update."
+  return 1
+}
+
+cmd_update() {
+  _update_index
 }
 
 cmd_upgrade() {
+  # `nix-env -u` only compares against the already-fetched channel snapshot;
+  # without a refresh first, "upgrade" silently finds nothing to do even when
+  # newer versions exist upstream. Refresh first, like `pacman -Syu`.
+  _update_index || warn "Continuing with the existing snapshot; run 'nixpm update' when connectivity returns."
+
   if [[ $# -eq 0 ]]; then
     out "Upgrading all installed packages..."
     nix-env -u
@@ -391,7 +407,7 @@ ${C_B}Commands:${C_RST}
   list                         List installed packages
   list-derivations             List installed packages with store paths
   update                       Update channels / flake inputs
-  upgrade [pkg...]             Upgrade all (or specific) packages
+  upgrade [pkg...]             Refresh index, then upgrade all (or given) packages
   shell   <pkg> [pkg...]       Enter a nix-shell with package(s)
   info    <pkg>                Show package metadata
   apps                         List installed packages with .desktop files
