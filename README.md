@@ -8,6 +8,7 @@ A tiny, friendly package-manager wrapper around [Nix](https://nixos.org/). Inspi
 
 - **`search`**, **`install`**, **`remove`**, **`list`** — the basics, done cleanly
 - **`info`** — one-line metadata (description, homepage, license, main program)
+- **`upgrade`** — refreshes the package index first, then upgrades everything (like `pacman -Syu`)
 - **`apps`** — see which installed Nix packages ship `.desktop` files
 - **Auto desktop reload** — detects Omarchy, Hyprland, Sway, or KDE Plasma and reloads the launcher/menu after install/remove
 - **Pure Bash** — no Python, no compiled code, one small script
@@ -64,7 +65,7 @@ nixpm shell go
 # Update nix channels / flake inputs
 nixpm update
 
-# Upgrade everything
+# Upgrade everything (refreshes the package index first, like pacman -Syu)
 nixpm upgrade
 ```
 
@@ -173,7 +174,7 @@ NIXPM_SEARCH_WORKERS=4                                          # eval workers f
 
 - [Nix](https://nixos.org/download/) package manager (multi-user mode recommended)
 - Bash 4.0+
-- `jq` (used for pretty `info` output)
+- `jq` (optional — pretty-prints `info` output; without it, `info` shows the raw JSON)
 
 ---
 
