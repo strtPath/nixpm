@@ -20,7 +20,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Hardcoded globals (override via config or env)
 # ---------------------------------------------------------------------------
-readonly NIXPM_VERSION="0.2.0"
+readonly NIXPM_VERSION="0.2.5"
 
 # ---------------------------------------------------------------------------
 # Configuration (sourced from file, optional)
@@ -32,6 +32,9 @@ NIXPM_CONFIG="${XDG_CONFIG_HOME}/nixpm/config"
 NIXPM_NIXPKGS="${NIXPM_NIXPKGS:-nixpkgs}"
 # true|false|auto  (auto=restart only if a supported DE/WM is detected)
 NIXPM_RESTART_MENU="${NIXPM_RESTART_MENU:-auto}"
+: "${NIXPM_SEARCH_CACHE_DIR:="${XDG_CACHE_HOME:-$HOME/.cache}/nixpm"}"
+: "${NIXPM_SEARCH_TTL:=86400}"   # seconds an index may be reused before rebuild
+: "${NIXPM_SEARCH_WORKERS:=4}"   # parallel eval workers for a (cold) index build
 
 # ---------------------------------------------------------------------------
 # Terminal colors
@@ -160,21 +163,201 @@ _nix_x() {
 }
 
 # ---------------------------------------------------------------------------
+# Local search index
+#
+# `nix search` re-evaluates the *whole* nixpkgs attribute set on every call
+# (the regex filter is applied after evaluation), which is why it feels slow
+# next to pacman — pacman just greps a pre-built local index. We mirror that:
+# build a local "all packages" index once, then grep it. The index is rebuilt
+# by `nixpm update` (like `pacman -Sy`) and lazily on search when it's stale.
+# ---------------------------------------------------------------------------
+
+# Cache filename for the given NIXPM_NIXPKGS value (sanitised so nixpkgs,
+# nixpkgs/nixos-24.05 & friends each get their own index).
+_search_index_path() {
+  local base
+  base="$(printf '%s' "${NIXPM_NIXPKGS}" | tr '[/.#[:space:]]' '_____')"
+  printf '%s\n' "${NIXPM_SEARCH_CACHE_DIR}/${base}-search"
+}
+
+# Is there a reasonably-fresh local index we can grep? 0=fresh, 1=missing/stale.
+_search_index_fresh() {
+  local path now
+  path="$(_search_index_path)"
+  [[ -f "$path" ]] || return 1
+  now="$(date +%s)"
+  [[ $((now - $(stat -c %Y "$path" 2>/dev/null || stat -f %m "$path" 2>/dev/null || echo 0))) -lt ${NIXPM_SEARCH_TTL:-86400} ]]
+}
+
+# Build a local "all packages" index. Returns the path on success, 1 on failure.
+_build_search_index() {
+  mkdir -p "$NIXPM_SEARCH_CACHE_DIR" || return 1
+  local path tmp rc
+  path="$(_search_index_path)"
+  tmp="${path}.$$"
+
+  # "^" matches every package. Evaluate just once (with parallel workers to cut
+  # the cold wall-clock), then write a clean, grep-able text index atomically.
+  if _nix_x search "$NIXPM_NIXPKGS" "^" \
+       --option workers "${NIXPM_SEARCH_WORKERS:-4}" \
+       >"$tmp" 2>/dev/null; then
+    sed -E -e 's/\x1b\[[0-9;]*m//g' \
+        -e 's/^\* legacyPackages\.[a-zA-Z0-9_-]+\./\* /' "$tmp" > "${tmp}.c"
+    rc=$?
+  else
+    rc=1
+  fi
+  if [[ $rc -eq 0 ]]; then
+    mv -f "${tmp}.c" "$path"
+    rm -f "$tmp"   # raw pre-sed output is no longer needed
+    printf '%s\n' "$path"
+  else
+    rm -f "$tmp" "${tmp}.c"
+    return 1
+  fi
+}
+
+# Grep a built index for a query across both package names and descriptions,
+# wrapping descriptions to the terminal width so narrow (tiled) terminals get
+# clean, indented continuation lines instead of confusing overflow.
+_search_cache_grep() {
+  local query="$1" index="$2" cols
+  cols="$(_term_cols)"
+  awk -v re="$query" -v cols="$cols" '
+    BEGIN { IGNORECASE = 1 }
+    /^\* / {
+      if (name != "" && keep) print_block()
+      name = $0; sub(/^\* /, "", name)
+      desc = ""; keep = (name ~ re)
+      next
+    }
+    {
+      line = $0; sub(/^  /, "", line)
+      if (desc == "") desc = line; else desc = desc " " line
+      if (line ~ re) keep = 1
+      next
+    }
+    END { if (name != "" && keep) print_block() }
+    function print_block(    rest, w) {
+      if (length(name) > cols - 10) name = substr(name, 1, cols - 13) "..."
+      if (length(desc) > (cols - 2) * 3) desc = substr(desc, 1, (cols - 2) * 3 - 3) "..."
+      printf "* %s\n", name
+      rest = desc
+      while (length(rest) > cols - 2) {
+        w = cols - 2
+        while (w > 0 && substr(rest, w, 1) != " ") w--
+        if (w <= 0) w = cols - 2
+        printf "  %s\n", substr(rest, 1, w)
+        rest = substr(rest, w + 1)
+        sub(/^ +/, "", rest)
+      }
+      if (rest != "") printf "  %s\n", rest
+    }
+  ' "$index" | sed -n '1,50p'
+}
+
+# Rebuild the search index (no-op-safe; used by `update`, mirrors `pacman -Sy`).
+_refresh_search_index() {
+  _build_search_index >/dev/null 2>&1 || \
+    warn "Could not rebuild the search index."
+}
+
+# ---------------------------------------------------------------------------
+# Terminal width / profile-generation helpers
+# ---------------------------------------------------------------------------
+
+# Terminal width for wrapping output (sane default when output is piped).
+_term_cols() {
+  local cols
+  cols="$(tput cols 2>/dev/null || echo 100)"
+  [[ "$cols" =~ ^[0-9]+$ && "$cols" -ge 40 ]] || cols=100
+  printf '%s\n' "$cols"
+}
+
+# Nix user-profile directory (XDG state layout used by Nix 2.15+).
+_profile_dir() {
+  printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/nix/profiles"
+}
+
+# Resolve a symlink to its absolute target. GNU readlink -f isn't available on
+# macOS/BSD, so fall back to realpath / python3, then to the input path.
+_realpath() {
+  local p="$1" out
+  out="$(readlink -f -- "$p" 2>/dev/null)" && { printf '%s\n' "$out"; return 0; }
+  out="$(command -v realpath >/dev/null 2>&1 && realpath "$p" 2>/dev/null)" && { printf '%s\n' "$out"; return 0; }
+  out="$(command -v python3 >/dev/null 2>&1 && python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' -- "$p" 2>/dev/null)" && { printf '%s\n' "$out"; return 0; }
+  printf '%s\n' "$p"
+}
+
+# Human size of the closure a store path keeps alive ("gone" / "unknown").
+_gen_closure_size() {
+  local p="$1" out
+  [[ -e "$p" ]] || { printf 'gone\n'; return 0; }
+  out="$(_nix_x path-info --closure-size --human-readable "$p" 2>/dev/null)" || { printf 'unknown\n'; return 0; }
+  printf '%s\n' "$out" | awk '{print $(NF-1) " " $NF; exit}'
+}
+
+# List one profile's generations as "N<tab>created<tab>size" (sorted by N).
+_profile_generations() {
+  local base="$1" dir link b n when size
+  dir="$(_profile_dir)"
+  [[ -d "$dir" ]] || return 0
+  for link in "$dir"/"$base"-*-link; do
+    [[ -L "$link" ]] || continue
+    b="$(basename "$link")"
+    n="${b#"$base"-}"
+    n="${n%-link}"
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    when="$( { stat -c %y "$link" 2>/dev/null || stat -f '%Sm' -t '%Y-%m-%d %H:%M:%S' "$link" 2>/dev/null; } | cut -d. -f1)"
+    size="$(_gen_closure_size "$(_realpath "$link")")"
+    printf '%s\t%s\t%s\n' "$n" "$when" "$size"
+  done | sort -n -t$'\t' -k1,1
+}
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
 cmd_search() {
-  local query
+  local query cols
   query="${1:-}"
   [[ -z "$query" ]] && die "Usage: nixpm search <query>"
+  cols="$(_term_cols)"
   out "Searching nixpkgs for '${query}'..."
 
-  local errfile
-  errfile="$(mktemp)" || die "Failed to create a temporary file."
+  # Fast path: a reasonably-fresh local index already exists, so just grep it
+  # (the same cost as pacman grepping its sync database).
+  if _search_index_fresh; then
+    local hits
+    hits="$(_search_cache_grep "$query" "$(_search_index_path)")"
+    if [[ -n "$hits" ]]; then
+      printf '%s\n' "$hits"
+      return 0
+    fi
+    warn "No packages in '${NIXPM_NIXPKGS}' match '${query}'."
+    exit 1
+  fi
 
-  # Capture nix output and its exit status separately: a failed nix run must
-  # be reported, never masqueraded as "no matches".
-  local raw rc=0
+  # Slow path: no fresh index yet. nix evaluates the *entire* package set for
+  # any search, so build the full local index from this one evaluation (parallel
+  # workers keep the cold wall-clock low) and serve the query from it. That turns
+  # the next `nixpm search` into an instant local grep.
+  out "Building local search index (first search is slower; later ones are instant)..."
+  local index match
+  if index="$(_build_search_index)"; then
+    match="$(_search_cache_grep "$query" "$index")"
+    if [[ -n "$match" ]]; then
+      printf '%s\n' "$match"
+      return 0
+    fi
+    warn "No packages in '${NIXPM_NIXPKGS}' match '${query}'."
+    exit 1
+  fi
+
+  # Index build failed (e.g. no network). Fall back to a plain live search with
+  # the original error reporting, so the user always sees *why*.
+  local errfile raw rc=0
+  errfile="$(mktemp)" || die "Failed to create a temporary file."
   raw="$(_nix_x search "$NIXPM_NIXPKGS" "$query" 2>"$errfile")" || rc=$?
 
   # "No matches" on its own: nix exits 0 (or 1 on newer versions with an
@@ -197,11 +380,10 @@ cmd_search() {
     exit 1
   fi
   rm -f "$errfile"
-
   printf '%s\n' "$raw" | \
     sed -E 's/\x1b\[[0-9;]*m//g' | \
     sed -E 's/^\* legacyPackages\.[a-zA-Z0-9_-]+\./* /' | \
-    awk '
+    awk -v cols="$cols" '
       BEGIN { pkg=""; desc=""; has_pkg=0 }
       /^\* / {
         if (has_pkg) print_entry()
@@ -211,11 +393,22 @@ cmd_search() {
       /^  / { sub(/^  /, ""); desc = (desc=="" ? $0 : desc " " $0); next }
       { if (has_pkg) desc = desc " " $0 }
       END { if (has_pkg) print_entry() }
-      function print_entry() {
-        if (length(desc) > 110) desc = substr(desc, 1, 107) "..."
-        printf "%s\n  %s\n", pkg, desc
+      function print_entry(    rest, w) {
+        if (length(pkg) > cols - 10) pkg = substr(pkg, 1, cols - 13) "..."
+        if (length(desc) > (cols - 2) * 3) desc = substr(desc, 1, (cols - 2) * 3 - 3) "..."
+        printf "%s\n", pkg
+        rest = desc
+        while (length(rest) > cols - 2) {
+          w = cols - 2
+          while (w > 0 && substr(rest, w, 1) != " ") w--
+          if (w <= 0) w = cols - 2
+          printf "  %s\n", substr(rest, 1, w)
+          rest = substr(rest, w + 1)
+          sub(/^ +/, "", rest)
+        }
+        if (rest != "") printf "  %s\n", rest
       }
-    ' | head -50
+    ' | sed -n '1,50p'
 }
 
 cmd_install() {
@@ -255,6 +448,7 @@ _update_index() {
   out "Refreshing package index..."
   if nix-channel --update 2>/dev/null; then
     ok "Channels updated."
+    _refresh_search_index
     return 0
   fi
 
@@ -264,6 +458,7 @@ _update_index() {
   # flake.lock just because an upgrade was run from there.
   if [[ -f flake.nix || -f flake.lock ]] && has_cmd nix && _nix_x flake update 2>/dev/null; then
     ok "Flake inputs updated."
+    _refresh_search_index
     return 0
   fi
 
@@ -394,6 +589,130 @@ cmd_version() {
   printf "nixpm %s\n" "$NIXPM_VERSION"
 }
 
+# Print a numbered table of one profile's generations (dates + closure sizes).
+_print_generations() {
+  local base="$1" dir n when size cur
+  dir="$(_profile_dir)"
+  while IFS=$'\t' read -r n when size; do
+    cur=""
+    [[ "$(readlink "$dir/$base" 2>/dev/null)" == "$base-$n-link" ]] && cur="  <- current"
+    printf '  %-4s %-19s  %12s%s\n' "$n" "$when" "$size" "$cur"
+  done < <(_profile_generations "$base")
+}
+
+cmd_generations() {
+  local dir
+  dir="$(_profile_dir)"
+  [[ -d "$dir" ]] || die "No Nix profile generations found (nothing installed yet?)."
+
+  out "Channels profile — what each nixpkgs snapshot keeps in the store:"
+  printf '  %-4s %-19s  %12s\n' "#" "created" "closure size"
+  _print_generations channels
+
+  out "User environment profile generations:"
+  printf '  %-4s %-19s  %12s\n' "#" "created" "closure size"
+  _print_generations profile
+
+  info "Closure size = everything that generation keeps alive in the store, not just its own files."
+  out "Reclaim space: nixpm prune"
+  info "Free the disk afterwards with: nix-store --gc"
+}
+
+cmd_prune() {
+  local remove="" do_gc=false arg dir resp
+  for arg in "$@"; do
+    case "$arg" in
+      --gc) do_gc=true ;;
+      *)
+        if [[ "$arg" =~ ^[0-9]+$ ]]; then
+          remove="$arg"
+        else
+          die "Usage: nixpm prune [N] [--gc] — remove N past generations (default: ask)"
+        fi
+        ;;
+    esac
+  done
+  dir="$(_profile_dir)"
+  [[ -d "$dir" ]] || die "No Nix profile generations found (nothing installed yet?)."
+
+  # Only user-environment generations are pruned. (The channels profile pins
+  # nixpkgs snapshots — smaller, rebuilt on every update; `generations` shows
+  # both. Add a --channels mode here if you ever want it.)
+  local lines=() total current=0 max=0
+  mapfile -t lines < <(_profile_generations profile)
+  total=${#lines[@]}
+  [[ $total -gt 0 ]] || die "No user-environment generations found."
+  if [[ "$(readlink "$dir/profile" 2>/dev/null)" =~ profile-([0-9]+)-link ]]; then
+    current="${BASH_REMATCH[1]}"
+  fi
+
+  # Interactively choose how many past generations to remove.
+  if [[ -z "$remove" ]]; then
+    if [[ -t 0 ]]; then
+      max=$((total - 1))
+      [[ $max -ge 1 ]] || { ok "Only the current generation exists — nothing to prune."; return 0; }
+      out "Current generations (user environment):"
+      _print_generations profile
+      info "Prune keeps the current generation and removes past ones from the Nix store,"
+      info "starting with the oldest so recent generations stay rollback-able."
+      info "1 = the oldest generation, ${max} = all of them."
+      read -rp "How many past generations should I remove (max ${max}, 0 = cancel)? [1] " remove || remove=""
+      [[ -z "$remove" ]] && remove=1
+    else
+      die "Nothing to do: 'prune' needs a count when not interactive. Try: nixpm prune N"
+    fi
+  fi
+  [[ "$remove" =~ ^[0-9]+$ ]] || die "Invalid generation count: '${remove}'"
+  (( remove == 0 )) && { ok "Nothing removed."; return 0; }
+  max=$((total - 1))
+  if (( remove > max )); then
+    info "${remove} requested — clamped to ${max} (all past generations)."
+    remove="$max"
+  fi
+
+  # Walk oldest→newest (lines are ascending), skipping the current generation,
+  # deleting up to N — so the most recent past generations stay available for
+  # rollback as long as possible.
+  local removed_total=0 remaining=$remove i line n when size
+  for ((i = 0; i < total; i++)); do
+    (( remaining > 0 )) || break
+    line="${lines[$i]}"
+    IFS=$'\t' read -r n when size <<< "$line"
+    [[ "$n" == "$current" ]] && continue
+    out "Removed generation $n  ($when)  — was keeping ~${size} alive"
+    rm -f "$dir/profile-$n-link"
+    removed_total=$((removed_total + 1))
+    remaining=$((remaining - 1))
+  done
+
+  if (( removed_total == 0 )); then
+    ok "Nothing removed."
+    return 0
+  fi
+  ok "Removed ${removed_total} past generation(s) — they are only disconnected; the store paths are still on disk."
+
+  # Reclaim the disk space — with --gc consent already given, otherwise ask.
+  local reclaim=false
+  if [[ "$do_gc" == true ]]; then
+    reclaim=true
+  elif [[ -t 0 ]]; then
+    info "Run 'nix-store --gc' to delete the disconnected store paths that no remaining"
+    info "generation or running process references — this cannot be undone."
+    read -rp "Reclaim the disk space with 'nix-store --gc' now? [y/N] " resp || resp=""
+    case "$resp" in
+      y|Y|yes|Yes|YES) reclaim=true ;;
+    esac
+  fi
+
+  if [[ "$reclaim" == true ]]; then
+    out "Running nix-store --gc..."
+    nix-store --gc
+    ok "Garbage collection finished."
+  else
+    info "Reclaim the space any time with: nix-store --gc"
+  fi
+}
+
 cmd_help() {
   cat <<EOF
 ${C_B}nixpm${C_RST} — a tiny package-manager wrapper around Nix
@@ -411,6 +730,9 @@ ${C_B}Commands:${C_RST}
   shell   <pkg> [pkg...]       Enter a nix-shell with package(s)
   info    <pkg>                Show package metadata
   apps                         List installed packages with .desktop files
+  generations                  Show profile generations & how much disk each holds
+  prune   [N] [--gc]           Remove N past generations, oldest first (keeps the current
+                               one; prompts if N omitted); --gc also runs nix-store --gc after
   restart-menu                 Reload the desktop session / app menu
   version, --version, -V       Show version
   help,    --help,    -h       Show this help
@@ -418,12 +740,17 @@ ${C_B}Commands:${C_RST}
 ${C_B}Configuration:${C_RST} ~/.config/nixpm/config (bash-sourced)
   NIXPM_NIXPKGS="nixpkgs"       # Nixpkgs attribute path (or channel name)
   NIXPM_RESTART_MENU="auto"     # true | false | auto
+  NIXPM_SEARCH_CACHE_DIR=...    # Dir for the local search index (default: ~/.cache/nixpm)
+  NIXPM_SEARCH_TTL=86400        # Seconds before an index is rebuilt on search
+  NIXPM_SEARCH_WORKERS=4        # Parallel eval workers for a cold index build
 
 ${C_B}Notes:${C_RST}
   * "auto" (default) restarts the session only when a supported DE/WM
     (Omarchy, Hyprland, Sway, KDE Plasma) is detected.
   * On unsupported desktops you may need to log out and back in for
     .desktop files to become visible.
+  * "search" greps a local index built by the first search / `nixpm update`,
+    so it feels as fast as pacman after the index is warm.
 
 EOF
 }
@@ -465,6 +792,8 @@ main() {
     info|I)                cmd_info "$@" ;;
     apps)                  cmd_apps ;;
     restart-menu|refresh)  cmd_restart_menu ;;
+    generations|gens)      cmd_generations ;;
+    prune)                 cmd_prune "$@" ;;
     version|--version|-V)  cmd_version ;;
     help|--help|-h)        cmd_help ;;
     *)                     die "Unknown command: $cmd. Run 'nixpm help' for usage." ;;
