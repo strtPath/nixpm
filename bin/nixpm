@@ -20,7 +20,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Hardcoded globals (override via config or env)
 # ---------------------------------------------------------------------------
-readonly NIXPM_VERSION="0.2.5"
+readonly NIXPM_VERSION="0.2.6"
 
 # ---------------------------------------------------------------------------
 # Configuration (sourced from file, optional)
@@ -749,7 +749,7 @@ ${C_B}Notes:${C_RST}
     (Omarchy, Hyprland, Sway, KDE Plasma) is detected.
   * On unsupported desktops you may need to log out and back in for
     .desktop files to become visible.
-  * "search" greps a local index built by the first search / `nixpm update`,
+  * "search" greps a local index built by the first search / 'nixpm update',
     so it feels as fast as pacman after the index is warm.
 
 EOF
