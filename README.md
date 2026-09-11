@@ -67,6 +67,12 @@ nixpm update
 
 # Upgrade everything (refreshes the package index first, like pacman -Syu)
 nixpm upgrade
+
+# See how much disk each profile generation pins
+nixpm generations
+
+# Delete all but the newest generation (then: nix-store --gc)
+nixpm prune
 ```
 
 ### Global flags
@@ -167,6 +173,34 @@ NIXPM_SEARCH_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/nixpm"  # where the inde
 NIXPM_SEARCH_TTL=86400                                          # rebuild after 24h (seconds)
 NIXPM_SEARCH_WORKERS=4                                          # eval workers for a cold index build
 ```
+
+---
+
+## Storage & eviction
+
+nixpm's own cache is small and flat: the local search index
+(`~/.cache/nixpm/<source>-search`, ~10 MB per package source) is replaced
+in place on rebuild, so it does not grow over time.
+
+The big disk user is Nix itself. Every `nixpm update` (and every `upgrade`,
+which refreshes first) downloads a fresh nixpkgs snapshot — hundreds of MB
+— into `/nix/store`, and each profile generation keeps its snapshot and its
+packages alive.
+
+See what's holding space and trim it:
+
+```bash
+nixpm generations        # list generations + how much disk each pins
+nixpm prune              # keep only the newest generation
+nixpm prune 3            # keep the newest 3 generations
+nix-store --gc           # actually reclaim the freed disk space
+```
+
+`nixpm prune` only drops the generation links. Run `nix-store --gc` to
+reclaim the space (Nix may also collect garbage automatically over time).
+
+If you interrupt a cold search-index build, a temporary file may be left in
+`NIXPM_SEARCH_CACHE_DIR` — safe to delete.
 
 ---
 

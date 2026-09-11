@@ -20,7 +20,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Hardcoded globals (override via config or env)
 # ---------------------------------------------------------------------------
-readonly NIXPM_VERSION="0.2.2"
+readonly NIXPM_VERSION="0.2.3"
 
 # ---------------------------------------------------------------------------
 # Configuration (sourced from file, optional)
@@ -218,10 +218,12 @@ _build_search_index() {
 }
 
 # Grep a built index for a query across both package names and descriptions,
-# preserving the readable "* name / description" layout.
+# wrapping descriptions to the terminal width so narrow (tiled) terminals get
+# clean, indented continuation lines instead of confusing overflow.
 _search_cache_grep() {
-  local query="$1" index="$2"
-  awk -v re="$query" '
+  local query="$1" index="$2" cols
+  cols="$(_term_cols)"
+  awk -v re="$query" -v cols="$cols" '
     BEGIN { IGNORECASE = 1 }
     /^\* / {
       if (name != "" && keep) print_block()
@@ -236,9 +238,20 @@ _search_cache_grep() {
       next
     }
     END { if (name != "" && keep) print_block() }
-    function print_block() {
-      if (length(desc) > 110) desc = substr(desc, 1, 107) "..."
-      printf "* %s\n  %s\n", name, desc
+    function print_block(    rest, w) {
+      if (length(name) > cols - 10) name = substr(name, 1, cols - 13) "..."
+      if (length(desc) > (cols - 2) * 3) desc = substr(desc, 1, (cols - 2) * 3 - 3) "..."
+      printf "* %s\n", name
+      rest = desc
+      while (length(rest) > cols - 2) {
+        w = cols - 2
+        while (w > 0 && substr(rest, w, 1) != " ") w--
+        if (w <= 0) w = cols - 2
+        printf "  %s\n", substr(rest, 1, w)
+        rest = substr(rest, w + 1)
+        sub(/^ +/, "", rest)
+      }
+      if (rest != "") printf "  %s\n", rest
     }
   ' "$index" | sed -n '1,50p'
 }
@@ -250,13 +263,56 @@ _refresh_search_index() {
 }
 
 # ---------------------------------------------------------------------------
+# Terminal width / profile-generation helpers
+# ---------------------------------------------------------------------------
+
+# Terminal width for wrapping output (sane default when output is piped).
+_term_cols() {
+  local cols
+  cols="$(tput cols 2>/dev/null || echo 100)"
+  [[ "$cols" =~ ^[0-9]+$ && "$cols" -ge 40 ]] || cols=100
+  printf '%s\n' "$cols"
+}
+
+# Nix user-profile directory (XDG state layout used by Nix 2.15+).
+_profile_dir() {
+  printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/nix/profiles"
+}
+
+# Human size of the closure a store path keeps alive ("gone" / "unknown").
+_gen_closure_size() {
+  local p="$1" out
+  [[ -e "$p" ]] || { printf 'gone\n'; return 0; }
+  out="$(_nix_x path-info --closure-size --human-readable "$p" 2>/dev/null)" || { printf 'unknown\n'; return 0; }
+  printf '%s\n' "$out" | awk '{print $(NF-1) " " $NF; exit}'
+}
+
+# List one profile's generations as "N<tab>created<tab>size" (sorted by N).
+_profile_generations() {
+  local base="$1" dir link b n when size
+  dir="$(_profile_dir)"
+  [[ -d "$dir" ]] || return 0
+  for link in "$dir"/"$base"-*-link; do
+    [[ -L "$link" ]] || continue
+    b="$(basename "$link")"
+    n="${b#"$base"-}"
+    n="${n%-link}"
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    when="$(stat -c %y "$link" 2>/dev/null | cut -d. -f1)"
+    size="$(_gen_closure_size "$(readlink -f "$link" 2>/dev/null)")"
+    printf '%s\t%s\t%s\n' "$n" "$when" "$size"
+  done | sort -n -t$'\t' -k1,1
+}
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
 cmd_search() {
-  local query
+  local query cols
   query="${1:-}"
   [[ -z "$query" ]] && die "Usage: nixpm search <query>"
+  cols="$(_term_cols)"
   out "Searching nixpkgs for '${query}'..."
 
   # Fast path: a reasonably-fresh local index already exists, so just grep it
@@ -317,7 +373,7 @@ cmd_search() {
   printf '%s\n' "$raw" | \
     sed -E 's/\x1b\[[0-9;]*m//g' | \
     sed -E 's/^\* legacyPackages\.[a-zA-Z0-9_-]+\./* /' | \
-    awk '
+    awk -v cols="$cols" '
       BEGIN { pkg=""; desc=""; has_pkg=0 }
       /^\* / {
         if (has_pkg) print_entry()
@@ -327,9 +383,20 @@ cmd_search() {
       /^  / { sub(/^  /, ""); desc = (desc=="" ? $0 : desc " " $0); next }
       { if (has_pkg) desc = desc " " $0 }
       END { if (has_pkg) print_entry() }
-      function print_entry() {
-        if (length(desc) > 110) desc = substr(desc, 1, 107) "..."
-        printf "%s\n  %s\n", pkg, desc
+      function print_entry(    rest, w) {
+        if (length(pkg) > cols - 10) pkg = substr(pkg, 1, cols - 13) "..."
+        if (length(desc) > (cols - 2) * 3) desc = substr(desc, 1, (cols - 2) * 3 - 3) "..."
+        printf "%s\n", pkg
+        rest = desc
+        while (length(rest) > cols - 2) {
+          w = cols - 2
+          while (w > 0 && substr(rest, w, 1) != " ") w--
+          if (w <= 0) w = cols - 2
+          printf "  %s\n", substr(rest, 1, w)
+          rest = substr(rest, w + 1)
+          sub(/^ +/, "", rest)
+        }
+        if (rest != "") printf "  %s\n", rest
       }
     ' | sed -n '1,50p'
 }
@@ -512,6 +579,63 @@ cmd_version() {
   printf "nixpm %s\n" "$NIXPM_VERSION"
 }
 
+cmd_generations() {
+  local dir
+  dir="$(_profile_dir)"
+  [[ -d "$dir" ]] || die "No Nix profile generations found (nothing installed yet?)."
+
+  out "Channels profile — what each nixpkgs snapshot keeps in the store:"
+  printf '  %-4s %-19s  %12s\n' "#" "created" "closure size"
+  local n when size cur
+  while IFS=$'\t' read -r n when size; do
+    cur=""
+    [[ "$(readlink "$dir/channels" 2>/dev/null)" == "channels-$n-link" ]] && cur="  <- current"
+    printf '  %-4s %-19s  %12s%s\n' "$n" "$when" "$size" "$cur"
+  done < <(_profile_generations channels)
+
+  out "User environment profile generations:"
+  printf '  %-4s %-19s  %12s\n' "#" "created" "closure size"
+  while IFS=$'\t' read -r n when size; do
+    cur=""
+    [[ "$(readlink "$dir/profile" 2>/dev/null)" == "profile-$n-link" ]] && cur="  <- current"
+    printf '  %-4s %-19s  %12s%s\n' "$n" "$when" "$size" "$cur"
+  done < <(_profile_generations profile)
+
+  warn "Closure size = everything that generation keeps alive in the store, not just its own files."
+  info "Reclaim space:  nixpm prune [N]   then   nix-store --gc"
+}
+
+cmd_prune() {
+  local keep="${1:-1}" dir threshold n size
+  dir="$(_profile_dir)"
+  [[ "$keep" =~ ^[0-9]+$ ]] || die "Usage: nixpm prune [N] — keep the newest N generations"
+  (( keep >= 1 )) || die "Usage: nixpm prune [N] — keep the newest N generations"
+
+  for base in channels profile; do
+    local gens=() total i
+    mapfile -t gens < <(_profile_generations "$base" | cut -f1)
+    [[ ${#gens[@]} -gt 0 ]] || continue
+    total=${#gens[@]}
+    if (( keep >= total )); then
+      info "${base}: keeping all ${total} generations (nothing to remove)."
+      continue
+    fi
+    threshold=${gens[$((total - keep))]}   # first generation number we keep
+    for n in "${gens[@]}"; do
+      (( n < threshold )) || continue
+      if [[ "$(readlink "$dir/$base" 2>/dev/null)" == "$base-$n-link" ]]; then
+        warn "Skipping $base-$n-link (current generation)."
+        continue
+      fi
+      size="$(_gen_closure_size "$(readlink -f "$dir/$base-$n-link")")"
+      out "Removing $base-$n-link (keeps ~${size} alive)"
+      rm -f "$dir/$base-$n-link"
+    done
+  done
+  ok "Generation links removed. Actually free the disk space:"
+  info "  nix-store --gc        # or: nix-collect-garbage -d"
+}
+
 cmd_help() {
   cat <<EOF
 ${C_B}nixpm${C_RST} — a tiny package-manager wrapper around Nix
@@ -529,6 +653,8 @@ ${C_B}Commands:${C_RST}
   shell   <pkg> [pkg...]       Enter a nix-shell with package(s)
   info    <pkg>                Show package metadata
   apps                         List installed packages with .desktop files
+  generations                  Show profile generations & how much disk each holds
+  prune   [N]                  Delete all but the newest N generations (default 1)
   restart-menu                 Reload the desktop session / app menu
   version, --version, -V       Show version
   help,    --help,    -h       Show this help
@@ -588,6 +714,8 @@ main() {
     info|I)                cmd_info "$@" ;;
     apps)                  cmd_apps ;;
     restart-menu|refresh)  cmd_restart_menu ;;
+    generations|gens)      cmd_generations ;;
+    prune)                 cmd_prune "$@" ;;
     version|--version|-V)  cmd_version ;;
     help|--help|-h)        cmd_help ;;
     *)                     die "Unknown command: $cmd. Run 'nixpm help' for usage." ;;
