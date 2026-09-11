@@ -20,7 +20,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Hardcoded globals (override via config or env)
 # ---------------------------------------------------------------------------
-readonly NIXPM_VERSION="0.2.4"
+readonly NIXPM_VERSION="0.2.5"
 
 # ---------------------------------------------------------------------------
 # Configuration (sourced from file, optional)
@@ -279,6 +279,16 @@ _profile_dir() {
   printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/nix/profiles"
 }
 
+# Resolve a symlink to its absolute target. GNU readlink -f isn't available on
+# macOS/BSD, so fall back to realpath / python3, then to the input path.
+_realpath() {
+  local p="$1" out
+  out="$(readlink -f -- "$p" 2>/dev/null)" && { printf '%s\n' "$out"; return 0; }
+  out="$(command -v realpath >/dev/null 2>&1 && realpath "$p" 2>/dev/null)" && { printf '%s\n' "$out"; return 0; }
+  out="$(command -v python3 >/dev/null 2>&1 && python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' -- "$p" 2>/dev/null)" && { printf '%s\n' "$out"; return 0; }
+  printf '%s\n' "$p"
+}
+
 # Human size of the closure a store path keeps alive ("gone" / "unknown").
 _gen_closure_size() {
   local p="$1" out
@@ -298,8 +308,8 @@ _profile_generations() {
     n="${b#"$base"-}"
     n="${n%-link}"
     [[ "$n" =~ ^[0-9]+$ ]] || continue
-    when="$(stat -c %y "$link" 2>/dev/null | cut -d. -f1)"
-    size="$(_gen_closure_size "$(readlink -f "$link" 2>/dev/null)")"
+    when="$( { stat -c %y "$link" 2>/dev/null || stat -f '%Sm' -t '%Y-%m-%d %H:%M:%S' "$link" 2>/dev/null; } | cut -d. -f1)"
+    size="$(_gen_closure_size "$(_realpath "$link")")"
     printf '%s\t%s\t%s\n' "$n" "$when" "$size"
   done | sort -n -t$'\t' -k1,1
 }
@@ -579,6 +589,17 @@ cmd_version() {
   printf "nixpm %s\n" "$NIXPM_VERSION"
 }
 
+# Print a numbered table of one profile's generations (dates + closure sizes).
+_print_generations() {
+  local base="$1" dir n when size cur
+  dir="$(_profile_dir)"
+  while IFS=$'\t' read -r n when size; do
+    cur=""
+    [[ "$(readlink "$dir/$base" 2>/dev/null)" == "$base-$n-link" ]] && cur="  <- current"
+    printf '  %-4s %-19s  %12s%s\n' "$n" "$when" "$size" "$cur"
+  done < <(_profile_generations "$base")
+}
+
 cmd_generations() {
   local dir
   dir="$(_profile_dir)"
@@ -586,83 +607,109 @@ cmd_generations() {
 
   out "Channels profile — what each nixpkgs snapshot keeps in the store:"
   printf '  %-4s %-19s  %12s\n' "#" "created" "closure size"
-  local n when size cur
-  while IFS=$'\t' read -r n when size; do
-    cur=""
-    [[ "$(readlink "$dir/channels" 2>/dev/null)" == "channels-$n-link" ]] && cur="  <- current"
-    printf '  %-4s %-19s  %12s%s\n' "$n" "$when" "$size" "$cur"
-  done < <(_profile_generations channels)
+  _print_generations channels
 
   out "User environment profile generations:"
   printf '  %-4s %-19s  %12s\n' "#" "created" "closure size"
-  while IFS=$'\t' read -r n when size; do
-    cur=""
-    [[ "$(readlink "$dir/profile" 2>/dev/null)" == "profile-$n-link" ]] && cur="  <- current"
-    printf '  %-4s %-19s  %12s%s\n' "$n" "$when" "$size" "$cur"
-  done < <(_profile_generations profile)
+  _print_generations profile
 
-  warn "Closure size = everything that generation keeps alive in the store, not just its own files."
-  info "Reclaim space:  nixpm prune [N]   then   nix-store --gc"
+  info "Closure size = everything that generation keeps alive in the store, not just its own files."
+  out "Reclaim space: nixpm prune"
+  info "Free the disk afterwards with: nix-store --gc"
 }
 
 cmd_prune() {
-  local keep=1 do_gc=false arg dir threshold n size
+  local remove="" do_gc=false arg dir resp
   for arg in "$@"; do
     case "$arg" in
       --gc) do_gc=true ;;
       *)
         if [[ "$arg" =~ ^[0-9]+$ ]]; then
-          keep="$arg"
+          remove="$arg"
         else
-          die "Usage: nixpm prune [N] [--gc] — keep the newest N generations (default 1)"
+          die "Usage: nixpm prune [N] [--gc] — remove N past generations (default: ask)"
         fi
         ;;
     esac
   done
-  (( keep >= 1 )) || die "Usage: nixpm prune [N] [--gc] — keep the newest N generations (default 1)"
   dir="$(_profile_dir)"
+  [[ -d "$dir" ]] || die "No Nix profile generations found (nothing installed yet?)."
 
-  for base in channels profile; do
-    local gens=() total i
-    mapfile -t gens < <(_profile_generations "$base" | cut -f1)
-    [[ ${#gens[@]} -gt 0 ]] || continue
-    total=${#gens[@]}
-    if (( keep >= total )); then
-      info "${base}: keeping all ${total} generations (nothing to remove)."
-      continue
+  # Only user-environment generations are pruned. (The channels profile pins
+  # nixpkgs snapshots — smaller, rebuilt on every update; `generations` shows
+  # both. Add a --channels mode here if you ever want it.)
+  local lines=() total current=0 max=0
+  mapfile -t lines < <(_profile_generations profile)
+  total=${#lines[@]}
+  [[ $total -gt 0 ]] || die "No user-environment generations found."
+  if [[ "$(readlink "$dir/profile" 2>/dev/null)" =~ profile-([0-9]+)-link ]]; then
+    current="${BASH_REMATCH[1]}"
+  fi
+
+  # Interactively choose how many past generations to remove.
+  if [[ -z "$remove" ]]; then
+    if [[ -t 0 ]]; then
+      max=$((total - 1))
+      [[ $max -ge 1 ]] || { ok "Only the current generation exists — nothing to prune."; return 0; }
+      out "Current generations (user environment):"
+      _print_generations profile
+      info "Prune keeps the current generation and removes past ones from the Nix store,"
+      info "starting with the oldest so recent generations stay rollback-able."
+      info "1 = the oldest generation, ${max} = all of them."
+      read -rp "How many past generations should I remove (max ${max}, 0 = cancel)? [1] " remove || remove=""
+      [[ -z "$remove" ]] && remove=1
+    else
+      die "Nothing to do: 'prune' needs a count when not interactive. Try: nixpm prune N"
     fi
-    threshold=${gens[$((total - keep))]}   # first generation number we keep
-    for n in "${gens[@]}"; do
-      (( n < threshold )) || continue
-      if [[ "$(readlink "$dir/$base" 2>/dev/null)" == "$base-$n-link" ]]; then
-        warn "Skipping $base-$n-link (current generation)."
-        continue
-      fi
-      size="$(_gen_closure_size "$(readlink -f "$dir/$base-$n-link")")"
-      out "Removing $base-$n-link (keeps ~${size} alive)"
-      rm -f "$dir/$base-$n-link"
-    done
+  fi
+  [[ "$remove" =~ ^[0-9]+$ ]] || die "Invalid generation count: '${remove}'"
+  (( remove == 0 )) && { ok "Nothing removed."; return 0; }
+  max=$((total - 1))
+  if (( remove > max )); then
+    info "${remove} requested — clamped to ${max} (all past generations)."
+    remove="$max"
+  fi
+
+  # Walk oldest→newest (lines are ascending), skipping the current generation,
+  # deleting up to N — so the most recent past generations stay available for
+  # rollback as long as possible.
+  local removed_total=0 remaining=$remove i line n when size
+  for ((i = 0; i < total; i++)); do
+    (( remaining > 0 )) || break
+    line="${lines[$i]}"
+    IFS=$'\t' read -r n when size <<< "$line"
+    [[ "$n" == "$current" ]] && continue
+    out "Removed generation $n  ($when)  — was keeping ~${size} alive"
+    rm -f "$dir/profile-$n-link"
+    removed_total=$((removed_total + 1))
+    remaining=$((remaining - 1))
   done
 
-  ok "Generation links removed."
+  if (( removed_total == 0 )); then
+    ok "Nothing removed."
+    return 0
+  fi
+  ok "Removed ${removed_total} past generation(s) — they are only disconnected; the store paths are still on disk."
+
+  # Reclaim the disk space — with --gc consent already given, otherwise ask.
+  local reclaim=false
   if [[ "$do_gc" == true ]]; then
-    info "Pruning only drops the generation links — the store paths they referenced"
-    info "are still on disk. Running 'nix-store --gc' deletes every store path that"
-    info "no remaining generation or running process references. This cannot be undone."
-    local resp=""
-    read -rp "Run 'nix-store --gc' now to reclaim that disk space? [y/N] " resp || resp=""
+    reclaim=true
+  elif [[ -t 0 ]]; then
+    info "Run 'nix-store --gc' to delete the disconnected store paths that no remaining"
+    info "generation or running process references — this cannot be undone."
+    read -rp "Reclaim the disk space with 'nix-store --gc' now? [y/N] " resp || resp=""
     case "$resp" in
-      y|Y|yes|Yes|YES)
-        out "Running nix-store --gc..."
-        nix-store --gc
-        ok "Garbage collection finished."
-        ;;
-      *)
-        warn "Skipped GC. Reclaim any time with: nix-store --gc"
-        ;;
+      y|Y|yes|Yes|YES) reclaim=true ;;
     esac
+  fi
+
+  if [[ "$reclaim" == true ]]; then
+    out "Running nix-store --gc..."
+    nix-store --gc
+    ok "Garbage collection finished."
   else
-    info "Reclaim the space with: nix-store --gc   (or: nix-collect-garbage -d)"
+    info "Reclaim the space any time with: nix-store --gc"
   fi
 }
 
@@ -684,8 +731,8 @@ ${C_B}Commands:${C_RST}
   info    <pkg>                Show package metadata
   apps                         List installed packages with .desktop files
   generations                  Show profile generations & how much disk each holds
-  prune   [N] [--gc]           Delete all but the newest N generations (default 1);
-                               --gc also reclaims the disk space after (with a prompt)
+  prune   [N] [--gc]           Remove N past generations, oldest first (keeps the current
+                               one; prompts if N omitted); --gc also runs nix-store --gc after
   restart-menu                 Reload the desktop session / app menu
   version, --version, -V       Show version
   help,    --help,    -h       Show this help

@@ -71,11 +71,12 @@ nixpm upgrade
 # See how much disk each profile generation pins
 nixpm generations
 
-# Delete all but the newest generation (then: nix-store --gc)
+# Remove past generations — asks how many to remove (starting with the oldest, so
+# recent generations stay rollback-able), shows what was removed, then offers GC
 nixpm prune
 
-# ...or reclaim the freed disk space right away (prompts first)
-nixpm prune --gc
+# Non-interactive: remove the 3 oldest generations; --gc reclaims right away
+nixpm prune 3 --gc
 ```
 
 ### Global flags
@@ -194,9 +195,9 @@ See what's holding space and trim it:
 
 ```bash
 nixpm generations        # list generations + how much disk each pins
-nixpm prune              # keep only the newest generation
-nixpm prune 3            # keep the newest 3 generations
-nixpm prune --gc         # prune, then offer to run nix-store --gc (prompted)
+nixpm prune              # interactively remove the oldest generations (keeps the current)
+nixpm prune 3            # remove the 3 oldest generations
+nixpm prune --gc         # prune, then reclaim with nix-store --gc (asks first when interactive)
 nix-store --gc           # actually reclaim the freed disk space
 ```
 
