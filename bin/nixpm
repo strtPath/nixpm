@@ -20,7 +20,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Hardcoded globals (override via config or env)
 # ---------------------------------------------------------------------------
-readonly NIXPM_VERSION="0.2.1"
+readonly NIXPM_VERSION="0.2.2"
 
 # ---------------------------------------------------------------------------
 # Configuration (sourced from file, optional)
@@ -209,6 +209,7 @@ _build_search_index() {
   fi
   if [[ $rc -eq 0 ]]; then
     mv -f "${tmp}.c" "$path"
+    rm -f "$tmp"   # raw pre-sed output is no longer needed
     printf '%s\n' "$path"
   else
     rm -f "$tmp" "${tmp}.c"
@@ -239,7 +240,7 @@ _search_cache_grep() {
       if (length(desc) > 110) desc = substr(desc, 1, 107) "..."
       printf "* %s\n  %s\n", name, desc
     }
-  ' "$index" | head -50
+  ' "$index" | sed -n '1,50p'
 }
 
 # Rebuild the search index (no-op-safe; used by `update`, mirrors `pacman -Sy`).
@@ -330,7 +331,7 @@ cmd_search() {
         if (length(desc) > 110) desc = substr(desc, 1, 107) "..."
         printf "%s\n  %s\n", pkg, desc
       }
-    ' | head -50
+    ' | sed -n '1,50p'
 }
 
 cmd_install() {
