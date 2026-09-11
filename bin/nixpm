@@ -20,7 +20,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Hardcoded globals (override via config or env)
 # ---------------------------------------------------------------------------
-readonly NIXPM_VERSION="0.2.6"
+readonly NIXPM_VERSION="0.2.7"
 
 # ---------------------------------------------------------------------------
 # Configuration (sourced from file, optional)
@@ -470,20 +470,54 @@ cmd_update() {
   _update_index
 }
 
+# Run one `nix-env -u` invocation, streaming output straight to the terminal, and
+# write the "upgrading 'A' to 'B'" lines to $1 so the caller can print a summary at
+# the end — no one should have to scroll up past the fetched-paths noise.
+_upgrade_run() {
+  local sumfile="$1" tmp rc=0 out; shift
+  tmp="$(mktemp)" || die "Failed to create a temporary file."
+  if "$@" 2>&1 | tee "$tmp"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  out="$(grep -E "^(upgrading|downgrading) '" "$tmp" 2>/dev/null | \
+    sed -E "s/^upgrading '//; s/^downgrading '/(downgraded) /; s/' to '/ -> /; s/'$//" || true)"
+  rm -f "$tmp"
+  printf '%s\n' "$out" > "$sumfile"
+  return "$rc"
+}
+
 cmd_upgrade() {
   # `nix-env -u` only compares against the already-fetched channel snapshot;
   # without a refresh first, "upgrade" silently finds nothing to do even when
   # newer versions exist upstream. Refresh first, like `pacman -Syu`.
   _update_index || warn "Continuing with the existing snapshot; run 'nixpm update' when connectivity returns."
 
+  local summary="" piece sumfile
+  sumfile="$(mktemp)" || die "Failed to create a temporary file."
   if [[ $# -eq 0 ]]; then
     out "Upgrading all installed packages..."
-    nix-env -u
+    _upgrade_run "$sumfile" nix-env -u || { local rc=$?; rm -f "$sumfile"; return "$rc"; }
+    summary="$(<"$sumfile")"
   else
     for pkg in "$@"; do
       out "Upgrading ${pkg}..."
-      nix-env -u "$pkg"
+      _upgrade_run "$sumfile" nix-env -u "$pkg" || { local rc=$?; rm -f "$sumfile"; return "$rc"; }
+      piece="$(<"$sumfile")"
+      if [[ -n "$piece" ]]; then
+        [[ -n "$summary" ]] && summary+=$'\n'
+        summary+="$piece"
+      fi
     done
+  fi
+  rm -f "$sumfile"
+
+  if [[ -n "$summary" ]]; then
+    ok "Upgrades applied:"
+    printf '%s\n' "$summary" | sort -u | sed 's/^/  /'
+  else
+    ok "Everything is up to date."
   fi
   _post_install_reload
 }

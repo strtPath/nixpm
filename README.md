@@ -65,7 +65,8 @@ nixpm shell go
 # Update nix channels / flake inputs
 nixpm update
 
-# Upgrade everything (refreshes the package index first, like pacman -Syu)
+# Upgrade everything (refreshes the package index first, like pacman -Syu);
+# prints a summary of what actually changed
 nixpm upgrade
 
 # See how much disk each profile generation pins
