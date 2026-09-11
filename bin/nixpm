@@ -20,7 +20,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Hardcoded globals (override via config or env)
 # ---------------------------------------------------------------------------
-readonly NIXPM_VERSION="0.2.3"
+readonly NIXPM_VERSION="0.2.4"
 
 # ---------------------------------------------------------------------------
 # Configuration (sourced from file, optional)
@@ -606,10 +606,21 @@ cmd_generations() {
 }
 
 cmd_prune() {
-  local keep="${1:-1}" dir threshold n size
+  local keep=1 do_gc=false arg dir threshold n size
+  for arg in "$@"; do
+    case "$arg" in
+      --gc) do_gc=true ;;
+      *)
+        if [[ "$arg" =~ ^[0-9]+$ ]]; then
+          keep="$arg"
+        else
+          die "Usage: nixpm prune [N] [--gc] — keep the newest N generations (default 1)"
+        fi
+        ;;
+    esac
+  done
+  (( keep >= 1 )) || die "Usage: nixpm prune [N] [--gc] — keep the newest N generations (default 1)"
   dir="$(_profile_dir)"
-  [[ "$keep" =~ ^[0-9]+$ ]] || die "Usage: nixpm prune [N] — keep the newest N generations"
-  (( keep >= 1 )) || die "Usage: nixpm prune [N] — keep the newest N generations"
 
   for base in channels profile; do
     local gens=() total i
@@ -632,8 +643,27 @@ cmd_prune() {
       rm -f "$dir/$base-$n-link"
     done
   done
-  ok "Generation links removed. Actually free the disk space:"
-  info "  nix-store --gc        # or: nix-collect-garbage -d"
+
+  ok "Generation links removed."
+  if [[ "$do_gc" == true ]]; then
+    info "Pruning only drops the generation links — the store paths they referenced"
+    info "are still on disk. Running 'nix-store --gc' deletes every store path that"
+    info "no remaining generation or running process references. This cannot be undone."
+    local resp=""
+    read -rp "Run 'nix-store --gc' now to reclaim that disk space? [y/N] " resp || resp=""
+    case "$resp" in
+      y|Y|yes|Yes|YES)
+        out "Running nix-store --gc..."
+        nix-store --gc
+        ok "Garbage collection finished."
+        ;;
+      *)
+        warn "Skipped GC. Reclaim any time with: nix-store --gc"
+        ;;
+    esac
+  else
+    info "Reclaim the space with: nix-store --gc   (or: nix-collect-garbage -d)"
+  fi
 }
 
 cmd_help() {
@@ -654,7 +684,8 @@ ${C_B}Commands:${C_RST}
   info    <pkg>                Show package metadata
   apps                         List installed packages with .desktop files
   generations                  Show profile generations & how much disk each holds
-  prune   [N]                  Delete all but the newest N generations (default 1)
+  prune   [N] [--gc]           Delete all but the newest N generations (default 1);
+                               --gc also reclaims the disk space after (with a prompt)
   restart-menu                 Reload the desktop session / app menu
   version, --version, -V       Show version
   help,    --help,    -h       Show this help

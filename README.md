@@ -73,6 +73,9 @@ nixpm generations
 
 # Delete all but the newest generation (then: nix-store --gc)
 nixpm prune
+
+# ...or reclaim the freed disk space right away (prompts first)
+nixpm prune --gc
 ```
 
 ### Global flags
@@ -193,11 +196,13 @@ See what's holding space and trim it:
 nixpm generations        # list generations + how much disk each pins
 nixpm prune              # keep only the newest generation
 nixpm prune 3            # keep the newest 3 generations
+nixpm prune --gc         # prune, then offer to run nix-store --gc (prompted)
 nix-store --gc           # actually reclaim the freed disk space
 ```
 
-`nixpm prune` only drops the generation links. Run `nix-store --gc` to
-reclaim the space (Nix may also collect garbage automatically over time).
+`nixpm prune` only drops the generation links; run `nix-store --gc` to
+reclaim the space — or let `nixpm prune --gc` do both, prompting first.
+(Nix may also collect garbage automatically over time.)
 
 If you interrupt a cold search-index build, a temporary file may be left in
 `NIXPM_SEARCH_CACHE_DIR` — safe to delete.
