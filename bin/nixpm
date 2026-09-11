@@ -20,7 +20,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Hardcoded globals (override via config or env)
 # ---------------------------------------------------------------------------
-readonly NIXPM_VERSION="0.1.0"
+readonly NIXPM_VERSION="0.2.1"
 
 # ---------------------------------------------------------------------------
 # Configuration (sourced from file, optional)
@@ -32,6 +32,9 @@ NIXPM_CONFIG="${XDG_CONFIG_HOME}/nixpm/config"
 NIXPM_NIXPKGS="${NIXPM_NIXPKGS:-nixpkgs}"
 # true|false|auto  (auto=restart only if a supported DE/WM is detected)
 NIXPM_RESTART_MENU="${NIXPM_RESTART_MENU:-auto}"
+: "${NIXPM_SEARCH_CACHE_DIR:="${XDG_CACHE_HOME:-$HOME/.cache}/nixpm"}"
+: "${NIXPM_SEARCH_TTL:=86400}"   # seconds an index may be reused before rebuild
+: "${NIXPM_SEARCH_WORKERS:=4}"   # parallel eval workers for a (cold) index build
 
 # ---------------------------------------------------------------------------
 # Terminal colors
@@ -160,6 +163,92 @@ _nix_x() {
 }
 
 # ---------------------------------------------------------------------------
+# Local search index
+#
+# `nix search` re-evaluates the *whole* nixpkgs attribute set on every call
+# (the regex filter is applied after evaluation), which is why it feels slow
+# next to pacman — pacman just greps a pre-built local index. We mirror that:
+# build a local "all packages" index once, then grep it. The index is rebuilt
+# by `nixpm update` (like `pacman -Sy`) and lazily on search when it's stale.
+# ---------------------------------------------------------------------------
+
+# Cache filename for the given NIXPM_NIXPKGS value (sanitised so nixpkgs,
+# nixpkgs/nixos-24.05 & friends each get their own index).
+_search_index_path() {
+  local base
+  base="$(printf '%s' "${NIXPM_NIXPKGS}" | tr '[/.#[:space:]]' '_____')"
+  printf '%s\n' "${NIXPM_SEARCH_CACHE_DIR}/${base}-search"
+}
+
+# Is there a reasonably-fresh local index we can grep? 0=fresh, 1=missing/stale.
+_search_index_fresh() {
+  local path now
+  path="$(_search_index_path)"
+  [[ -f "$path" ]] || return 1
+  now="$(date +%s)"
+  [[ $((now - $(stat -c %Y "$path" 2>/dev/null || stat -f %m "$path" 2>/dev/null || echo 0))) -lt ${NIXPM_SEARCH_TTL:-86400} ]]
+}
+
+# Build a local "all packages" index. Returns the path on success, 1 on failure.
+_build_search_index() {
+  mkdir -p "$NIXPM_SEARCH_CACHE_DIR" || return 1
+  local path tmp rc
+  path="$(_search_index_path)"
+  tmp="${path}.$$"
+
+  # "^" matches every package. Evaluate just once (with parallel workers to cut
+  # the cold wall-clock), then write a clean, grep-able text index atomically.
+  if _nix_x search "$NIXPM_NIXPKGS" "^" \
+       --option workers "${NIXPM_SEARCH_WORKERS:-4}" \
+       >"$tmp" 2>/dev/null; then
+    sed -E -e 's/\x1b\[[0-9;]*m//g' \
+        -e 's/^\* legacyPackages\.[a-zA-Z0-9_-]+\./\* /' "$tmp" > "${tmp}.c"
+    rc=$?
+  else
+    rc=1
+  fi
+  if [[ $rc -eq 0 ]]; then
+    mv -f "${tmp}.c" "$path"
+    printf '%s\n' "$path"
+  else
+    rm -f "$tmp" "${tmp}.c"
+    return 1
+  fi
+}
+
+# Grep a built index for a query across both package names and descriptions,
+# preserving the readable "* name / description" layout.
+_search_cache_grep() {
+  local query="$1" index="$2"
+  awk -v re="$query" '
+    BEGIN { IGNORECASE = 1 }
+    /^\* / {
+      if (name != "" && keep) print_block()
+      name = $0; sub(/^\* /, "", name)
+      desc = ""; keep = (name ~ re)
+      next
+    }
+    {
+      line = $0; sub(/^  /, "", line)
+      if (desc == "") desc = line; else desc = desc " " line
+      if (line ~ re) keep = 1
+      next
+    }
+    END { if (name != "" && keep) print_block() }
+    function print_block() {
+      if (length(desc) > 110) desc = substr(desc, 1, 107) "..."
+      printf "* %s\n  %s\n", name, desc
+    }
+  ' "$index" | head -50
+}
+
+# Rebuild the search index (no-op-safe; used by `update`, mirrors `pacman -Sy`).
+_refresh_search_index() {
+  _build_search_index >/dev/null 2>&1 || \
+    warn "Could not rebuild the search index."
+}
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -169,7 +258,43 @@ cmd_search() {
   [[ -z "$query" ]] && die "Usage: nixpm search <query>"
   out "Searching nixpkgs for '${query}'..."
 
-  _nix_x search "$NIXPM_NIXPKGS" "$query" 2>/dev/null | \
+  # Fast path: a reasonably-fresh local index already exists, so just grep it
+  # (the same cost as pacman grepping its sync database).
+  if _search_index_fresh; then
+    local hits
+    hits="$(_search_cache_grep "$query" "$(_search_index_path)")"
+    if [[ -n "$hits" ]]; then
+      printf '%s\n' "$hits"
+      return 0
+    fi
+    warn "No packages in '${NIXPM_NIXPKGS}' match '${query}'."
+    exit 1
+  fi
+
+  # Slow path: no fresh index yet. nix evaluates the *entire* package set for
+  # any search, so build the full local index from this one evaluation (parallel
+  # workers keep the cold wall-clock low) and serve the query from it. That turns
+  # the next `nixpm search` into an instant local grep.
+  out "Building local search index (first search is slower; later ones are instant)..."
+  local index match ok_failed
+  if index="$(_build_search_index)"; then
+    match="$(_search_cache_grep "$query" "$index")"
+    if [[ -n "$match" ]]; then
+      printf '%s\n' "$match"
+      return 0
+    fi
+    warn "No packages in '${NIXPM_NIXPKGS}' match '${query}'."
+    exit 1
+  fi
+
+  # Index build failed (e.g. no network). Fall back to a plain live search.
+  local raw
+  raw="$(_nix_x search "$NIXPM_NIXPKGS" "$query" 2>/dev/null)"
+  if [[ -z "$raw" ]]; then
+    warn "No packages in '${NIXPM_NIXPKGS}' match '${query}'."
+    exit 1
+  fi
+  printf '%s\n' "$raw" | \
     sed -E 's/\x1b\[[0-9;]*m//g' | \
     sed -E 's/^\* legacyPackages\.[a-zA-Z0-9_-]+\./* /' | \
     awk '
@@ -223,12 +348,14 @@ cmd_update() {
   out "Updating Nix channels..."
   if nix-channel --update 2>/dev/null; then
     ok "Channels updated."
+    _refresh_search_index
     return 0
   fi
 
   warn "nix-channel --update failed (maybe using flakes?)."
   if has_cmd nix && _nix_x flake update 2>/dev/null; then
     ok "Flake inputs updated."
+    _refresh_search_index
     return 0
   fi
 
@@ -346,12 +473,17 @@ ${C_B}Commands:${C_RST}
 ${C_B}Configuration:${C_RST} ~/.config/nixpm/config (bash-sourced)
   NIXPM_NIXPKGS="nixpkgs"       # Nixpkgs attribute path (or channel name)
   NIXPM_RESTART_MENU="auto"     # true | false | auto
+  NIXPM_SEARCH_CACHE_DIR=...    # Dir for the local search index (default: ~/.cache/nixpm)
+  NIXPM_SEARCH_TTL=86400        # Seconds before an index is rebuilt on search
+  NIXPM_SEARCH_WORKERS=4        # Parallel eval workers for a cold index build
 
 ${C_B}Notes:${C_RST}
   * "auto" (default) restarts the session only when a supported DE/WM
     (Omarchy, Hyprland, Sway, KDE Plasma) is detected.
   * On unsupported desktops you may need to log out and back in for
     .desktop files to become visible.
+  * "search" greps a local index built by the first search / `nixpm update`,
+    so it feels as fast as pacman after the index is warm.
 
 EOF
 }

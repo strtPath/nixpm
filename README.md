@@ -157,6 +157,14 @@ NIXPM_NIXPKGS="nixpkgs"
 #   auto  = only if a supported DE/WM is detected (default)
 #   false = never try
 NIXPM_RESTART_MENU="auto"
+
+# --- Search speed (optional) ---
+# nixpm speeds up `search` by grepping a local index instead of asking nix to
+# re-evaluate the whole of nixpkgs every time (the same trick pacman uses with
+# its sync database).
+NIXPM_SEARCH_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/nixpm"  # where the index lives
+NIXPM_SEARCH_TTL=86400                                          # rebuild after 24h (seconds)
+NIXPM_SEARCH_WORKERS=4                                          # eval workers for a cold index build
 ```
 
 ---
@@ -175,8 +183,9 @@ You absolutely can — `nixpm` is just a thin wrapper that:
 
 1. Saves you typing `nix-env -iA nixpkgs.` prefixes
 2. Formats `nix search` output so it's readable
-3. Restarts your desktop environment automatically so new apps appear
-4. Provides familiar, short aliases (`search`, `install`, `remove`, `list`)
+3. Speeds up `search` by grepping a local index instead of re-evaluating nixpkgs each time
+4. Restarts your desktop environment automatically so new apps appear
+5. Provides familiar, short aliases (`search`, `install`, `remove`, `list`)
 
 If you prefer the raw Nix CLI, keep using it. `nixpm` is for people who want the Nix ecosystem without memorizing `nix-env` flags.
 
