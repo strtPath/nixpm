@@ -20,7 +20,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Hardcoded globals (override via config or env)
 # ---------------------------------------------------------------------------
-readonly NIXPM_VERSION="0.2.6"
+readonly NIXPM_VERSION="0.2.9"
 
 # ---------------------------------------------------------------------------
 # Configuration (sourced from file, optional)
@@ -467,7 +467,124 @@ _update_index() {
 }
 
 cmd_update() {
-  _update_index
+  if _update_index; then
+    _offer_update_preview
+  fi
+}
+
+# After a fresh channel update, offer to preview which installed packages can be
+# upgraded. The preview compares installed versions against the search index
+# that was just rebuilt (single grep-like pass) and only asks `nix` to compare
+# versions when candidate strings differ — so it's near-instant.
+_offer_update_preview() {
+  [[ -t 0 ]] || return 0
+  local resp
+  read -rp "Show which installed packages can be upgraded? [y/N] " resp || resp=""
+  case "$resp" in
+    y|Y|yes|Yes|YES) _preview_updates ;;
+  esac
+}
+
+_preview_updates() {
+  local index
+  index="$(_search_index_path)"
+  if [[ ! -f "$index" ]]; then
+    warn "No search index to compare against — run 'nixpm search' once (or 'nixpm update' again)."
+    return 1
+  fi
+  if ! _search_index_fresh; then
+    warn "Search index is stale; rebuild it with 'nixpm update' (which refreshes the index)."
+    return 1
+  fi
+
+  # Installed packages as "name oldver" (drv name + version from `nix-env -q`).
+  local installed=() line name oldver results="" found=0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    name="${line%-*}"
+    oldver="${line##*-}"
+    [[ -n "$name" && -n "$oldver" ]] || continue
+    installed+=("$name $oldver")
+  done < <(nix-env -q 2>/dev/null)
+  [[ ${#installed[@]} -gt 0 ]] || { ok "No installed packages to check."; return 0; }
+
+  out "Comparing installed packages against the updated channel..."
+  local names nlist
+  names="$(printf '%s\n' "${installed[@]}" | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]' | sort -u)"
+
+  # One pass over the fresh index: emit "base<TAB>version" for every attr whose
+  # base name matches an installed package (case-insensitive; attr naming can
+  # differ from the drv name, e.g. OpenTabletDriver vs opentabletdriver).
+  local candidates
+  candidates="$(awk -v nlist="$names" '
+    BEGIN { split(nlist, a, "\n"); for (i in a) want[tolower(a[i])] = 1 }
+    /^\* / {
+      line = substr($0, 3)
+      p = index(line, " (")
+      if (!p) next
+      path = substr(line, 1, p - 1)
+      ver = substr(line, p + 2)
+      sub(/\)$/, "", ver)
+      if (ver == "") next
+      if (index(path, ".")) { d = index(path, "."); base = substr(path, d + 1) } else { base = path }
+      if (want[tolower(base)]) print tolower(base) "\t" ver
+    }' "$index" 2>/dev/null || true)"
+  [[ -n "$candidates" ]] || { ok "Nothing matches in the fresh channel."; return 0; }
+
+  # Per installed package: pick the newest candidate that is strictly newer,
+  # using nix's own version comparator (nix eval, only run when strings differ).
+  local entry cand best_lower best
+  for entry in "${installed[@]}"; do
+    name="${entry%% *}"
+    oldver="${entry#* }"
+    best_lower="${name,,}"
+    best=""
+    while IFS= read -r cand; do
+      [[ "$cand" == "$oldver" ]] && continue
+      if [[ -z "$best" ]]; then
+        _version_gt "$cand" "$oldver" && best="$cand"
+      else
+        _version_gt "$cand" "$best" && best="$cand"
+      fi
+    done < <(printf '%s\n' "$candidates" | awk -F'\t' -v n="$best_lower" '$1 == n {print $2}')
+    if [[ -n "$best" ]]; then
+      results+="${name}: ${oldver} -> ${best}"$'\n'
+      found=1
+    fi
+  done
+
+  if [[ $found -eq 1 ]]; then
+    ok "New versions available:"
+    printf '%s\n' "${results%$'\n'}" | sort -u | sed 's/^/  /'
+    info "Install them with: nixpm upgrade"
+  else
+    ok "All installed packages are already up to date."
+  fi
+}
+
+# 1 if $1 > $2 using nix's version ordering (0 otherwise).
+_version_gt() {
+  local out
+  out="$(_nix_x eval --raw --expr "builtins.toString (if builtins.compareVersions \"$1\" \"$2\" > 0 then 1 else 0)" 2>/dev/null || echo 0)"
+  [[ "$out" == "1" ]]
+}
+
+# Run one `nix-env -u` invocation, streaming output straight to the terminal, and
+# write the "upgrading 'A' to 'B'" lines to $1 so the caller can print a summary at
+# the end — no one should have to scroll up past the fetched-paths noise.
+_upgrade_run() {
+  local sumfile="$1" tmp rc=0 out; shift
+  tmp="$(mktemp)" || die "Failed to create a temporary file."
+  if "$@" 2>&1 | tee "$tmp"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  out="$(grep -E "^(upgrading|downgrading) '" "$tmp" 2>/dev/null | \
+    sed -E "s/^upgrading '//; s/^downgrading '/(downgraded) /; s/' to '/ -> /; s/'$//" || true)"
+  rm -f "$tmp"
+  printf '%s\n' "$out" > "$sumfile"
+  return "$rc"
 }
 
 cmd_upgrade() {
@@ -476,14 +593,30 @@ cmd_upgrade() {
   # newer versions exist upstream. Refresh first, like `pacman -Syu`.
   _update_index || warn "Continuing with the existing snapshot; run 'nixpm update' when connectivity returns."
 
+  local summary="" piece sumfile
+  sumfile="$(mktemp)" || die "Failed to create a temporary file."
   if [[ $# -eq 0 ]]; then
     out "Upgrading all installed packages..."
-    nix-env -u
+    _upgrade_run "$sumfile" nix-env -u || { local rc=$?; rm -f "$sumfile"; return "$rc"; }
+    summary="$(<"$sumfile")"
   else
     for pkg in "$@"; do
       out "Upgrading ${pkg}..."
-      nix-env -u "$pkg"
+      _upgrade_run "$sumfile" nix-env -u "$pkg" || { local rc=$?; rm -f "$sumfile"; return "$rc"; }
+      piece="$(<"$sumfile")"
+      if [[ -n "$piece" ]]; then
+        [[ -n "$summary" ]] && summary+=$'\n'
+        summary+="$piece"
+      fi
     done
+  fi
+  rm -f "$sumfile"
+
+  if [[ -n "$summary" ]]; then
+    ok "Upgrades applied:"
+    printf '%s\n' "$summary" | sort -u | sed 's/^/  /'
+  else
+    ok "Everything is up to date."
   fi
   _post_install_reload
 }
@@ -725,7 +858,7 @@ ${C_B}Commands:${C_RST}
   remove  <pkg> [pkg...]       Uninstall package(s)
   list                         List installed packages
   list-derivations             List installed packages with store paths
-  update                       Update channels / flake inputs
+  update                       Update channels / flake inputs (optionally preview upgrades)
   upgrade [pkg...]             Refresh index, then upgrade all (or given) packages
   shell   <pkg> [pkg...]       Enter a nix-shell with package(s)
   info    <pkg>                Show package metadata
