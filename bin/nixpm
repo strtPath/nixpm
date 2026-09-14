@@ -20,7 +20,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Hardcoded globals (override via config or env)
 # ---------------------------------------------------------------------------
-readonly NIXPM_VERSION="0.2.7"
+readonly NIXPM_VERSION="0.2.8"
 
 # ---------------------------------------------------------------------------
 # Configuration (sourced from file, optional)
@@ -467,7 +467,39 @@ _update_index() {
 }
 
 cmd_update() {
-  _update_index
+  if _update_index; then
+    _offer_update_preview
+  fi
+}
+
+# After a fresh channel update, offer to preview which installed packages can be
+# upgraded. The check re-evaluates the fresh snapshot (like `nixpm upgrade`
+# will), which is why it's opt-in behind a prompt.
+_offer_update_preview() {
+  [[ -t 0 ]] || return 0
+  local resp
+  info "Preview checks your installed packages against the fresh channel (takes ~30-60 s)."
+  read -rp "Show which installed packages can be upgraded? [y/N] " resp || resp=""
+  case "$resp" in
+    y|Y|yes|Yes|YES) _preview_updates ;;
+  esac
+}
+
+# Dry-run `nix-env -u` and show what it would change.
+_preview_updates() {
+  local sumfile list
+  sumfile="$(mktemp)" || die "Failed to create a temporary file."
+  out "Checking installed packages for newer versions..."
+  _upgrade_run "$sumfile" nix-env -u --dry-run || { local rc=$?; rm -f "$sumfile"; warn "The check failed (exit $rc)."; return "$rc"; }
+  list="$(<"$sumfile")"
+  rm -f "$sumfile"
+  if [[ -n "$list" ]]; then
+    ok "New versions available:"
+    printf '%s\n' "$list" | sort -u | sed 's/^/  /'
+    info "Install them with: nixpm upgrade"
+  else
+    ok "All installed packages are already up to date."
+  fi
 }
 
 # Run one `nix-env -u` invocation, streaming output straight to the terminal, and
@@ -759,7 +791,7 @@ ${C_B}Commands:${C_RST}
   remove  <pkg> [pkg...]       Uninstall package(s)
   list                         List installed packages
   list-derivations             List installed packages with store paths
-  update                       Update channels / flake inputs
+  update                       Update channels / flake inputs (optionally preview upgrades)
   upgrade [pkg...]             Refresh index, then upgrade all (or given) packages
   shell   <pkg> [pkg...]       Enter a nix-shell with package(s)
   info    <pkg>                Show package metadata

@@ -62,7 +62,7 @@ nixpm info pavucontrol
 # Enter a temporary shell with the package available
 nixpm shell go
 
-# Update nix channels / flake inputs
+# Update nix channels / flake inputs; prompts to preview available upgrades
 nixpm update
 
 # Upgrade everything (refreshes the package index first, like pacman -Syu);
