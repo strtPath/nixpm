@@ -214,7 +214,10 @@ _search_index_fresh() {
   marker="$(_channel_marker_path)"
   if [[ -f "$marker" ]]; then
     mmt="$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null || echo 0)"
-    [[ "$imt" -ge "$mmt" ]] || return 1
+    # Strictly newer, not >=: index and marker mtimes carry whole-second
+    # precision, so an index built in the same second the channel refreshed
+    # could predate it and serve stale results.
+    [[ "$imt" -gt "$mmt" ]] || return 1
   fi
   return 0
 }
@@ -525,8 +528,10 @@ _preview_updates() {
 
   # Keep only the upgrade/downgrade decisions; the rest of the dry-run chatter
   # (evaluation warnings, "would be built" lists) is noise for the user.
+  # `|| true` guards the no-match case: grep exits 1 when nothing matches, and
+  # with set -euo pipefail that would abort before we can report "up to date".
   decisions="$(grep -E "^(upgrading|downgrading) '" "$work" 2>/dev/null | \
-    sed -E "s/^upgrading '//; s/^downgrading '/(downgraded) /; s/' to '/ -> /; s/'$//")"
+    sed -E "s/^upgrading '//; s/^downgrading '/(downgraded) /; s/' to '/ -> /; s/'$//" || true)"
   rm -f "$work"
 
   if [[ $rc -ne 0 ]]; then
@@ -539,7 +544,8 @@ _preview_updates() {
     return 0
   fi
 
-  ok "New versions available:"
+  # Decisions can include downgrades too, so don't claim these are upgrades.
+  ok "Package changes available:"
   printf '%s\n' "$decisions" | sort -u | sed 's/^/  /'
   info "Install them with: nixpm upgrade"
 }
