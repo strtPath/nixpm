@@ -2,9 +2,9 @@ name: lint
 
 on:
   push:
-    branches: [master, main]
+    branches: [dev, main]
   pull_request:
-    branches: [master, main]
+    branches: [main]
 
 jobs:
   shellcheck:
@@ -13,10 +13,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
       - name: Run ShellCheck
-        uses: koalaman/shellcheck-action@v0.1.0
-        with:
-          files: bin/nixpm scripts/install.sh
+        run: |
+          shellcheck --version
+          shellcheck bin/nixpm scripts/install.sh
 
       - name: Bash syntax check
         run: |
