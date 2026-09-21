@@ -1,0 +1,30 @@
+name: lint
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    name: shellcheck + syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Run ShellCheck
+        run: |
+          shellcheck --version
+          shellcheck bin/nixpm scripts/install.sh
+
+      - name: Bash syntax check
+        run: |
+          bash -n bin/nixpm
+          bash -n scripts/install.sh
+          echo "Syntax OK"

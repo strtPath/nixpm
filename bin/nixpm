@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1090,SC2034,SC2021
+#   SC1090: config path is dynamic (~/.config/nixpm/config), can't be followed.
+#   SC2034: C_CYN is set for API symmetry with the other color vars.
+#   SC2021: tr `[...]` here intentionally includes literal chars in the set.
 #
 # nixpm — Tiny Nix package manager wrapper with optional desktop integration
 #
@@ -20,7 +24,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Hardcoded globals (override via config or env)
 # ---------------------------------------------------------------------------
-readonly NIXPM_VERSION="0.2.9"
+readonly NIXPM_VERSION="0.3.0"
 
 # ---------------------------------------------------------------------------
 # Configuration (sourced from file, optional)
@@ -169,7 +173,9 @@ _nix_x() {
 # (the regex filter is applied after evaluation), which is why it feels slow
 # next to pacman — pacman just greps a pre-built local index. We mirror that:
 # build a local "all packages" index once, then grep it. The index is rebuilt
-# by `nixpm update` (like `pacman -Sy`) and lazily on search when it's stale.
+# lazily on search when it goes stale (TTL, or after a channel refresh — see
+# _channel_marker_path). It is intentionally NOT rebuilt eagerly by `nixpm
+# update`; that full-attribute eval is expensive and search-only.
 # ---------------------------------------------------------------------------
 
 # Cache filename for the given NIXPM_NIXPKGS value (sanitised so nixpkgs,
@@ -180,13 +186,40 @@ _search_index_path() {
   printf '%s\n' "${NIXPM_SEARCH_CACHE_DIR}/${base}-search"
 }
 
+# Marker recording when the channel/flake was last refreshed. A new copy of the
+# index is *not* built eagerly at update time (that's the slow full-attribute
+# eval); instead this marker lets the next `search` see that the cached index
+# predates the refreshed source and rebuild it lazily.
+_channel_marker_path() {
+  printf '%s\n' "${NIXPM_SEARCH_CACHE_DIR}/.last-update"
+}
+
+# Record that the package source changed. Called after a successful channel or
+# flake refresh so a pre-existing search index is treated as stale.
+_mark_channel_updated() {
+  mkdir -p "$NIXPM_SEARCH_CACHE_DIR" 2>/dev/null
+  touch "$(_channel_marker_path)" 2>/dev/null || true
+}
+
 # Is there a reasonably-fresh local index we can grep? 0=fresh, 1=missing/stale.
+# Fresh means it exists, is within the TTL, AND is newer than the last channel
+# refresh (an updated source invalidates any index built before it).
 _search_index_fresh() {
-  local path now
+  local path now marker imt mmt
   path="$(_search_index_path)"
   [[ -f "$path" ]] || return 1
   now="$(date +%s)"
-  [[ $((now - $(stat -c %Y "$path" 2>/dev/null || stat -f %m "$path" 2>/dev/null || echo 0))) -lt ${NIXPM_SEARCH_TTL:-86400} ]]
+  imt="$(stat -c %Y "$path" 2>/dev/null || stat -f %m "$path" 2>/dev/null || echo 0)"
+  [[ $((now - imt)) -lt ${NIXPM_SEARCH_TTL:-86400} ]] || return 1
+  marker="$(_channel_marker_path)"
+  if [[ -f "$marker" ]]; then
+    mmt="$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null || echo 0)"
+    # Strictly newer, not >=: index and marker mtimes carry whole-second
+    # precision, so an index built in the same second the channel refreshed
+    # could predate it and serve stale results.
+    [[ "$imt" -gt "$mmt" ]] || return 1
+  fi
+  return 0
 }
 
 # Build a local "all packages" index. Returns the path on success, 1 on failure.
@@ -254,12 +287,6 @@ _search_cache_grep() {
       if (rest != "") printf "  %s\n", rest
     }
   ' "$index" | sed -n '1,50p'
-}
-
-# Rebuild the search index (no-op-safe; used by `update`, mirrors `pacman -Sy`).
-_refresh_search_index() {
-  _build_search_index >/dev/null 2>&1 || \
-    warn "Could not rebuild the search index."
 }
 
 # ---------------------------------------------------------------------------
@@ -448,7 +475,7 @@ _update_index() {
   out "Refreshing package index..."
   if nix-channel --update 2>/dev/null; then
     ok "Channels updated."
-    _refresh_search_index
+    _mark_channel_updated
     return 0
   fi
 
@@ -458,7 +485,7 @@ _update_index() {
   # flake.lock just because an upgrade was run from there.
   if [[ -f flake.nix || -f flake.lock ]] && has_cmd nix && _nix_x flake update 2>/dev/null; then
     ok "Flake inputs updated."
-    _refresh_search_index
+    _mark_channel_updated
     return 0
   fi
 
@@ -473,9 +500,8 @@ cmd_update() {
 }
 
 # After a fresh channel update, offer to preview which installed packages can be
-# upgraded. The preview compares installed versions against the search index
-# that was just rebuilt (single grep-like pass) and only asks `nix` to compare
-# versions when candidate strings differ — so it's near-instant.
+# upgraded. The preview runs `nix-env -u --dry-run` (see _preview_updates), so it
+# uses nix's own notion of "upgradeable" rather than guessing from a search index.
 _offer_update_preview() {
   [[ -t 0 ]] || return 0
   local resp
@@ -486,87 +512,42 @@ _offer_update_preview() {
 }
 
 _preview_updates() {
-  local index
-  index="$(_search_index_path)"
-  if [[ ! -f "$index" ]]; then
-    warn "No search index to compare against — run 'nixpm search' once (or 'nixpm update' again)."
-    return 1
-  fi
-  if ! _search_index_fresh; then
-    warn "Search index is stale; rebuild it with 'nixpm update' (which refreshes the index)."
-    return 1
-  fi
+  local work rc=0 decisions
+  work="$(mktemp)" || die "Failed to create a temporary file."
 
-  # Installed packages as "name oldver" (drv name + version from `nix-env -q`).
-  local installed=() line name oldver results="" found=0
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    name="${line%-*}"
-    oldver="${line##*-}"
-    [[ -n "$name" && -n "$oldver" ]] || continue
-    installed+=("$name $oldver")
-  done < <(nix-env -q 2>/dev/null)
-  [[ ${#installed[@]} -gt 0 ]] || { ok "No installed packages to check."; return 0; }
-
-  out "Comparing installed packages against the updated channel..."
-  local names nlist
-  names="$(printf '%s\n' "${installed[@]}" | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]' | sort -u)"
-
-  # One pass over the fresh index: emit "base<TAB>version" for every attr whose
-  # base name matches an installed package (case-insensitive; attr naming can
-  # differ from the drv name, e.g. OpenTabletDriver vs opentabletdriver).
-  local candidates
-  candidates="$(awk -v nlist="$names" '
-    BEGIN { split(nlist, a, "\n"); for (i in a) want[tolower(a[i])] = 1 }
-    /^\* / {
-      line = substr($0, 3)
-      p = index(line, " (")
-      if (!p) next
-      path = substr(line, 1, p - 1)
-      ver = substr(line, p + 2)
-      sub(/\)$/, "", ver)
-      if (ver == "") next
-      if (index(path, ".")) { d = index(path, "."); base = substr(path, d + 1) } else { base = path }
-      if (want[tolower(base)]) print tolower(base) "\t" ver
-    }' "$index" 2>/dev/null || true)"
-  [[ -n "$candidates" ]] || { ok "Nothing matches in the fresh channel."; return 0; }
-
-  # Per installed package: pick the newest candidate that is strictly newer,
-  # using nix's own version comparator (nix eval, only run when strings differ).
-  local entry cand best_lower best
-  for entry in "${installed[@]}"; do
-    name="${entry%% *}"
-    oldver="${entry#* }"
-    best_lower="${name,,}"
-    best=""
-    while IFS= read -r cand; do
-      [[ "$cand" == "$oldver" ]] && continue
-      if [[ -z "$best" ]]; then
-        _version_gt "$cand" "$oldver" && best="$cand"
-      else
-        _version_gt "$cand" "$best" && best="$cand"
-      fi
-    done < <(printf '%s\n' "$candidates" | awk -F'\t' -v n="$best_lower" '$1 == n {print $2}')
-    if [[ -n "$best" ]]; then
-      results+="${name}: ${oldver} -> ${best}"$'\n'
-      found=1
-    fi
-  done
-
-  if [[ $found -eq 1 ]]; then
-    ok "New versions available:"
-    printf '%s\n' "${results%$'\n'}" | sort -u | sed 's/^/  /'
-    info "Install them with: nixpm upgrade"
+  out "Checking for upgradeable packages (dry run)..."
+  # `nix-env -u --dry-run` reuses nix's own upgrade logic and profile wiring,
+  # so there's no need to parse a separately-built search index or fork a
+  # `nix eval` per candidate package. It prints an "upgrading 'A' to 'B'" line
+  # (to stderr) for every move it *would* make — same format _upgrade_run sees.
+  if nix-env -u --dry-run >/dev/null 2>"$work"; then
+    rc=0
   else
-    ok "All installed packages are already up to date."
+    rc=$?
   fi
-}
 
-# 1 if $1 > $2 using nix's version ordering (0 otherwise).
-_version_gt() {
-  local out
-  out="$(_nix_x eval --raw --expr "builtins.toString (if builtins.compareVersions \"$1\" \"$2\" > 0 then 1 else 0)" 2>/dev/null || echo 0)"
-  [[ "$out" == "1" ]]
+  # Keep only the upgrade/downgrade decisions; the rest of the dry-run chatter
+  # (evaluation warnings, "would be built" lists) is noise for the user.
+  # `|| true` guards the no-match case: grep exits 1 when nothing matches, and
+  # with set -euo pipefail that would abort before we can report "up to date".
+  decisions="$(grep -E "^(upgrading|downgrading) '" "$work" 2>/dev/null | \
+    sed -E "s/^upgrading '//; s/^downgrading '/(downgraded) /; s/' to '/ -> /; s/'$//" || true)"
+  rm -f "$work"
+
+  if [[ $rc -ne 0 ]]; then
+    warn "nix-env dry run failed (exit $rc) — could not determine upgradeable packages."
+    return 1
+  fi
+
+  if [[ -z "$decisions" ]]; then
+    ok "All installed packages are already up to date."
+    return 0
+  fi
+
+  # Decisions can include downgrades too, so don't claim these are upgrades.
+  ok "Package changes available:"
+  printf '%s\n' "$decisions" | sort -u | sed 's/^/  /'
+  info "Install them with: nixpm upgrade"
 }
 
 # Run one `nix-env -u` invocation, streaming output straight to the terminal, and

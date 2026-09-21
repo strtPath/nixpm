@@ -10,6 +10,8 @@ A tiny, friendly package-manager wrapper around [Nix](https://nixos.org/). Inspi
 - **`info`** — one-line metadata (description, homepage, license, main program)
 - **`upgrade`** — refreshes the package index first, then upgrades everything (like `pacman -Syu`)
 - **`apps`** — see which installed Nix packages ship `.desktop` files
+- **`update` upgrade preview** — after refreshing channels, optionally shows exactly which installed packages can be upgraded (via `nix-env -u --dry-run`, so it uses nix's own version logic)
+- **`generations`/`prune`** — inspect profile generations and how much disk each pins; prune old ones and GC
 - **Auto desktop reload** — detects Omarchy, Hyprland, Sway, or KDE Plasma and reloads the launcher/menu after install/remove
 - **Pure Bash** — no Python, no compiled code, one small script
 - **Works everywhere Nix works** — Arch, NixOS, macOS, WSL, you name it
@@ -173,7 +175,9 @@ NIXPM_RESTART_MENU="auto"
 # --- Search speed (optional) ---
 # nixpm speeds up `search` by grepping a local index instead of asking nix to
 # re-evaluate the whole of nixpkgs every time (the same trick pacman uses with
-# its sync database).
+# its sync database). The index is built on the first `search` and rebuilt
+# lazily when it goes stale (after the TTL, or after a channel refresh) — not
+# eagerly on every `update`, which is why `update` stays fast.
 NIXPM_SEARCH_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/nixpm"  # where the index lives
 NIXPM_SEARCH_TTL=86400                                          # rebuild after 24h (seconds)
 NIXPM_SEARCH_WORKERS=4                                          # eval workers for a cold index build

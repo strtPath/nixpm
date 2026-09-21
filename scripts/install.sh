@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # nixpm installer
-# Install:   curl -fsSL https://raw.githubusercontent.com/strtPath/nixpm/main/install.sh | bash
+# Install:   cp scripts/install.sh ... (or curl -fsSL .../scripts/install.sh | bash)
 # Uninstall: rm ~/.local/bin/nixpm
 
 set -euo pipefail
 
-REPO="https://github.com/strtPath/nixpm"
 RAW="https://raw.githubusercontent.com/strtPath/nixpm/main/bin/nixpm"
 DESTDIR="${PREFIX:-${HOME}/.local}/bin"
 
