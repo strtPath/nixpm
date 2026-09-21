@@ -1,0 +1,25 @@
+name: lint
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  shellcheck:
+    name: shellcheck + syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        uses: koalaman/shellcheck-action@v0.1.0
+        with:
+          files: bin/nixpm scripts/install.sh
+
+      - name: Bash syntax check
+        run: |
+          bash -n bin/nixpm
+          bash -n scripts/install.sh
+          echo "Syntax OK"
