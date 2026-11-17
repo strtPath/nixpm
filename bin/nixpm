@@ -21,10 +21,18 @@
 
 set -euo pipefail
 
+# bash >= 4 required (mapfile in cmd_prune). macOS ships bash 3.2 — say so up
+# front instead of dying mid-command with 'mapfile: command not found'.
+if [[ -z "${BASH_VERSINFO:-}" || ${BASH_VERSINFO[0]} -lt 4 ]]; then
+  printf '==> nixpm requires bash >= 4 (found %s). On macOS: brew install bash.\n' \
+    "${BASH_VERSION:-unknown}" >&2
+  exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # Hardcoded globals (override via config or env)
 # ---------------------------------------------------------------------------
-readonly NIXPM_VERSION="0.3.0"
+readonly NIXPM_VERSION="0.3.1"
 
 # ---------------------------------------------------------------------------
 # Configuration (sourced from file, optional)
@@ -38,7 +46,11 @@ NIXPM_NIXPKGS="${NIXPM_NIXPKGS:-nixpkgs}"
 NIXPM_RESTART_MENU="${NIXPM_RESTART_MENU:-auto}"
 : "${NIXPM_SEARCH_CACHE_DIR:="${XDG_CACHE_HOME:-$HOME/.cache}/nixpm"}"
 : "${NIXPM_SEARCH_TTL:=86400}"   # seconds an index may be reused before rebuild
-: "${NIXPM_SEARCH_WORKERS:=4}"   # parallel eval workers for a (cold) index build
+: "${NIXPM_SEARCH_WORKERS:=4}"   # eval workers (no-op on upstream nix, honoured by Determinate Nix)
+: "${NIXPM_MIN_INDEX_MEM_MB:=6144}" # min RAM for full-package-set evals; 0 disables the gate
+# Test hooks for the RAM gate (normally /proc + /sys paths):
+: "${NIXPM_MEMINFO_FILE:=/proc/meminfo}"
+: "${NIXPM_CGROUP_FILE:=}"   # empty = auto-detect cgroup v2 then v1 limit
 
 # ---------------------------------------------------------------------------
 # Terminal colors
@@ -167,6 +179,55 @@ _nix_x() {
 }
 
 # ---------------------------------------------------------------------------
+# Full-evaluation RAM gate (R3)
+#
+# Two nixpm operations evaluate the ENTIRE nixpkgs package set: the cold
+# search index build, and the full `nix-env -u` upgrade scan. On machines
+# below roughly 6GB that is not slow — it is fatal (observed on a clean 4GB
+# container: load 21, ssh dead, hypervisor reset needed). These commands
+# refuse below NIXPM_MIN_INDEX_MEM_MB; everything else (install/remove/list
+# of single packages) never full-evals and stays ungated.
+# ---------------------------------------------------------------------------
+
+# Effective memory in MB: MemTotal, capped by any cgroup limit that applies
+# (containers). Treats "max" and the cgroup-v1 unlimited sentinel as absent.
+# Prints nothing when the size cannot be determined — callers treat unknown
+# as "big enough" (never refuse on a read failure).
+_effective_mem_mb() {
+  local v best="" f
+  v="$(awk '/^MemTotal:/{print $2; exit}' "${NIXPM_MEMINFO_FILE:-/proc/meminfo}" 2>/dev/null)" || true
+  [[ "$v" =~ ^[0-9]+$ ]] && best=$(( v / 1024 ))
+  for f in "${NIXPM_CGROUP_FILE:-}" \
+           /sys/fs/cgroup/memory.max \
+           /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+    [[ -n "$f" && -r "$f" ]] || continue
+    v="$(head -n 1 "$f" 2>/dev/null)" || true
+    [[ "$v" =~ ^[0-9]+$ ]] || continue              # "max" or junk = no limit
+    (( v >= (1 << 60) )) && continue                # cgroup v1 unlimited sentinel
+    v=$(( v / 1048576 ))
+    [[ -z "$best" || $v -lt $best ]] && best=$v
+  done
+  [[ -n "$best" ]] && printf '%s\n' "$best"
+  return 0
+}
+
+# Prints the refusal (stderr) and returns 1 when the machine is too small
+# for a full evaluation; returns 0 when the operation may run. Callers exit
+# 3 (= "cannot run", distinct from 1 = failure/no-match).
+_full_eval_gate() {
+  local what="$1" hint="$2" need="${NIXPM_MIN_INDEX_MEM_MB:-6144}" mem
+  [[ "$need" =~ ^[0-9]+$ ]] || need=6144
+  (( need == 0 )) && return 0
+  mem="$(_effective_mem_mb)"
+  [[ -n "$mem" ]] || return 0
+  (( mem >= need )) && return 0
+  err "Low-RAM mode: ${what} needs ~$(( (need + 1023) / 1024 ))GB of memory (found ${mem}MB) and can freeze this machine."
+  info "$hint"
+  info "Or set NIXPM_MIN_INDEX_MEM_MB=0 to try anyway."
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # Local search index
 #
 # `nix search` re-evaluates the *whole* nixpkgs attribute set on every call
@@ -223,23 +284,49 @@ _search_index_fresh() {
 }
 
 # Build a local "all packages" index. Returns the path on success, 1 on failure.
+# Callers must pass the full-eval RAM gate first: this evaluates ALL of nixpkgs.
 _build_search_index() {
   mkdir -p "$NIXPM_SEARCH_CACHE_DIR" || return 1
-  local path tmp rc
+  local path tmp rc hb=""
   path="$(_search_index_path)"
   tmp="${path}.$$"
 
-  # "^" matches every package. Evaluate just once (with parallel workers to cut
-  # the cold wall-clock), then write a clean, grep-able text index atomically.
+  # Heartbeat: a cold build runs for minutes and nix's own progress goes to
+  # /dev/null (below), so print our own counter to show the wait is alive.
+  # The ticker MUST die when this function ends — an orphaned ticker prints
+  # "building index... 80s" over the NEXT command. Sleep in 1s increments (not
+  # one long sleep): bash defers SIGTERM until the running sleep returns, so a
+  # `sleep 10` loop would stall every search by up to 10s at kill time.
+  _stop_hb() {
+    [[ -n "${hb:-}" ]] && { kill "$hb" 2>/dev/null || true; wait "$hb" 2>/dev/null || true; hb=""; }
+    return 0
+  }
+  trap '_stop_hb' RETURN INT TERM
+  (
+    n=0
+    while sleep 1; do
+      n=$((n + 1))
+      (( n % 10 == 0 )) && printf '  building index... %ss\n' "$n" >&2
+    done
+  ) &
+  hb=$!
+
+  # "^" matches every package. Evaluate just once (the workers passthrough is
+  # ignored by upstream nix, which warns about the unknown setting, but real
+  # on Determinate Nix), then write a clean, grep-able text index atomically.
   if _nix_x search "$NIXPM_NIXPKGS" "^" \
        --option workers "${NIXPM_SEARCH_WORKERS:-4}" \
        >"$tmp" 2>/dev/null; then
-    sed -E -e 's/\x1b\[[0-9;]*m//g' \
-        -e 's/^\* legacyPackages\.[a-zA-Z0-9_-]+\./\* /' "$tmp" > "${tmp}.c"
-    rc=$?
+    if sed -E -e 's/\x1b\[[0-9;]*m//g' \
+         -e 's/^\* legacyPackages\.[a-zA-Z0-9_-]+\./\* /' "$tmp" > "${tmp}.c"; then
+      rc=0
+    else
+      rc=1
+    fi
   else
     rc=1
   fi
+  _stop_hb
   if [[ $rc -eq 0 ]]; then
     mv -f "${tmp}.c" "$path"
     rm -f "$tmp"   # raw pre-sed output is no longer needed
@@ -250,14 +337,35 @@ _build_search_index() {
   fi
 }
 
+# Escape every ERE metacharacter so a query matches as a literal string
+# (search queries are plain text, not regex). The result MUST reach awk via
+# the environment (ENVIRON["RE"]) — `awk -v re=...` processes backslash
+# escapes itself and silently eats ours. Total function: every '\' is itself
+# escaped, so a trailing lone backslash cannot break the pattern; an empty
+# result is refused by the caller (an empty RE would match every package).
+_ere_escape() {
+  local q="$1" out="" i c
+  for ((i = 0; i < ${#q}; i++)); do
+    c="${q:i:1}"
+    case "$c" in
+      '.'|'^'|'$'|'['|']'|'{'|'}'|'('|')'|'*'|'+'|'?'|'|'|'\') out+="\\$c" ;;
+      *) out+="$c" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 # Grep a built index for a query across both package names and descriptions,
 # wrapping descriptions to the terminal width so narrow (tiled) terminals get
 # clean, indented continuation lines instead of confusing overflow.
 _search_cache_grep() {
-  local query="$1" index="$2" cols
+  local query="$1" index="$2" cols re
+  [[ -n "$query" ]] || return 1        # guard AGAIN: empty query = match-everything RE
+  re="$(_ere_escape "$query")"
+  [[ -n "$re" ]] || return 1
   cols="$(_term_cols)"
-  awk -v re="$query" -v cols="$cols" '
-    BEGIN { IGNORECASE = 1 }
+  RE="$re" awk -v cols="$cols" '
+    BEGIN { IGNORECASE = 1; re = ENVIRON["RE"] }
     /^\* / {
       if (name != "" && keep) print_block()
       name = $0; sub(/^\* /, "", name)
@@ -355,8 +463,12 @@ cmd_search() {
   # Fast path: a reasonably-fresh local index already exists, so just grep it
   # (the same cost as pacman grepping its sync database).
   if _search_index_fresh; then
-    local hits
-    hits="$(_search_cache_grep "$query" "$(_search_index_path)")"
+    local hits rc=0
+    hits="$(_search_cache_grep "$query" "$(_search_index_path)")" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+      warn "Local index search failed (exit $rc) — falling back to live search."
+      _live_search_fallback "$query"
+    fi
     if [[ -n "$hits" ]]; then
       printf '%s\n' "$hits"
       return 0
@@ -366,9 +478,12 @@ cmd_search() {
   fi
 
   # Slow path: no fresh index yet. nix evaluates the *entire* package set for
-  # any search, so build the full local index from this one evaluation (parallel
-  # workers keep the cold wall-clock low) and serve the query from it. That turns
-  # the next `nixpm search` into an instant local grep.
+  # any search, so run the full-eval RAM gate first (R3), then build the full
+  # local index from this one evaluation and serve the query from it. That
+  # turns the next `nixpm search` into an instant local grep.
+  _full_eval_gate "the search index (nix evaluates the whole package set)" \
+      "Install packages directly by name — 'nixpm install <name>' instantiates only that one attr." \
+      || exit 3
   out "Building local search index (first search is slower; later ones are instant)..."
   local index match
   if index="$(_build_search_index)"; then
@@ -383,9 +498,22 @@ cmd_search() {
 
   # Index build failed (e.g. no network). Fall back to a plain live search with
   # the original error reporting, so the user always sees *why*.
-  local errfile raw rc=0
+  _live_search_fallback "$query"
+}
+
+# Last-resort live search through `nix search` with full error reporting.
+# NOTE: this also evaluates the entire package set, so the RAM gate is
+# re-checked here — the warm-index path can land here when the index grep
+# fails unexpectedly. nix search treats its term as a regex, so the literal
+# query is passed escaped.
+_live_search_fallback() {
+  local query="$1" cols errfile raw rc=0
+  _full_eval_gate "the live nix search (nix evaluates the whole package set)" \
+      "Install packages directly by name — 'nixpm install <name>' instantiates only that one attr." \
+      || exit 3
+  cols="$(_term_cols)"
   errfile="$(mktemp)" || die "Failed to create a temporary file."
-  raw="$(_nix_x search "$NIXPM_NIXPKGS" "$query" 2>"$errfile")" || rc=$?
+  raw="$(_nix_x search "$NIXPM_NIXPKGS" "$(_ere_escape "$query")" 2>"$errfile")" || rc=$?
 
   # "No matches" on its own: nix exits 0 (or 1 on newer versions with an
   # "error: no results ..." note) and prints nothing to stdout.
@@ -513,6 +641,13 @@ _offer_update_preview() {
 
 _preview_updates() {
   local work rc=0 decisions
+  # A --dry-run scan instantiates the whole package set to compare versions —
+  # the same full evaluation as a cold search. On small machines skip the
+  # preview but let the (ungated) refresh itself finish.
+  if ! _full_eval_gate "the upgrade preview (nix-env -u --dry-run scans the whole package set)" \
+        "Skip it on small machines; 'nixpm upgrade <name>' upgrades one package without any scan."; then
+    return 0
+  fi
   work="$(mktemp)" || die "Failed to create a temporary file."
 
   out "Checking for upgradeable packages (dry run)..."
@@ -569,6 +704,15 @@ _upgrade_run() {
 }
 
 cmd_upgrade() {
+  # The full `nix-env -u` scan instantiates the entire package set to compare
+  # versions — the same freeze mechanism as a cold search, so it passes the
+  # same RAM gate (R11). A targeted `nixpm upgrade <pkg>` stays ungated.
+  if [[ $# -eq 0 ]]; then
+    _full_eval_gate "the full upgrade scan (nix-env -u compares against the whole package set)" \
+        "Upgrade one package at a time — 'nixpm upgrade <name>' skips the scan." \
+        || exit 3
+  fi
+
   # `nix-env -u` only compares against the already-fetched channel snapshot;
   # without a refresh first, "upgrade" silently finds nothing to do even when
   # newer versions exist upstream. Refresh first, like `pacman -Syu`.
@@ -668,16 +812,27 @@ cmd_apps() {
   local found=0
 
   while IFS= read -r line; do
-    local pkg outpath appdir dfiles
+    local pkg outpath rest p pfx dfiles
     pkg=${line%%[$' \t']*}
-    # Trim leading whitespace to get the store path
+    # Trim leading whitespace to get the out-path field
     outpath="${line#*[$' \t']}"
     outpath="${outpath#"${outpath%%[![:space:]]*}"}"
-    appdir="${outpath}/share/applications"
-    [[ -d "$appdir" ]] || continue
-
-    dfiles=$(find "$appdir" -maxdepth 1 -name "*.desktop" -print0 2>/dev/null | \
-             tr '\0' '\n' | head -n 5)
+    # Multi-output packages print several "attr=/nix/store/..." entries joined
+    # by ';' (e.g. geany: 'bin=...;man=...;dev=...') instead of one bare path.
+    # Strip the attr= prefixes and check every output — the .desktop files can
+    # live in any of them, so collect across all outputs before deciding.
+    dfiles=""
+    rest="$outpath"
+    while :; do
+      p="${rest%%;*}"
+      pfx="${p#*=}"
+      if [[ -n "$pfx" && -d "$pfx/share/applications" ]]; then
+        dfiles+="$(find "$pfx/share/applications" -maxdepth 1 -name '*.desktop' -print0 2>/dev/null | \
+                   tr '\0' '\n' | head -n 5)"$'\n'
+      fi
+      [[ "$p" == "$rest" ]] && break   # no ';' left: p was the final segment
+      rest="${rest#*;}"
+    done
     [[ -n "$dfiles" ]] || continue
 
     found=$((found + 1))
@@ -851,20 +1006,36 @@ ${C_B}Commands:${C_RST}
   version, --version, -V       Show version
   help,    --help,    -h       Show this help
 
+  --no-restart                 Skip the desktop menu reload (works before or
+                               after the subcommand, e.g. 'nixpm install hello
+                               --no-restart')
+
 ${C_B}Configuration:${C_RST} ~/.config/nixpm/config (bash-sourced)
-  NIXPM_NIXPKGS="nixpkgs"       # Nixpkgs attribute path (or channel name)
+  NIXPM_NIXPKGS="nixpkgs"       # Nix attribute path (or channel name)
   NIXPM_RESTART_MENU="auto"     # true | false | auto
   NIXPM_SEARCH_CACHE_DIR=...    # Dir for the local search index (default: ~/.cache/nixpm)
   NIXPM_SEARCH_TTL=86400        # Seconds before an index is rebuilt on search
-  NIXPM_SEARCH_WORKERS=4        # Parallel eval workers for a cold index build
+  NIXPM_SEARCH_WORKERS=4        # Eval workers on cold index build (upstream nix
+                                # ignores this; Determinate Nix honours it)
+  NIXPM_MIN_INDEX_MEM_MB=6144   # Refuse full-package-set operations below this
+                                # much RAM, in MB (0 = disable the guard)
 
 ${C_B}Notes:${C_RST}
   * "auto" (default) restarts the session only when a supported DE/WM
     (Omarchy, Hyprland, Sway, KDE Plasma) is detected.
   * On unsupported desktops you may need to log out and back in for
     .desktop files to become visible.
-  * "search" greps a local index built by the first search / 'nixpm update',
-    so it feels as fast as pacman after the index is warm.
+  * The FIRST "search" builds a local index by evaluating all of nixpkgs —
+    minutes on a modest machine. After that, searches are instant greps
+    until the index goes stale. "nixpm update" refreshes packages but does
+    not rebuild the search index.
+  * Search queries are literal strings, not regular expressions.
+  * On machines with less than ~6GB RAM, the first "search" and a full
+    "upgrade" refuse to run (they evaluate the entire package set and can
+    freeze small machines). Install or upgrade single packages by name —
+    that never evaluates the full set.
+  * Exit codes: 0 = success, 1 = failure / no match,
+    3 = cannot run (e.g. the low-RAM guard refused a full evaluation).
 
 EOF
 }
@@ -873,11 +1044,7 @@ EOF
 # Main
 # ---------------------------------------------------------------------------
 main() {
-  if ! has_cmd nix; then
-    die "Nix is not installed or not on PATH.\nSee https://nixos.org/download/"
-  fi
-
-  # Parse global flags
+  # Parse global flags that appear BEFORE the subcommand.
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help)    cmd_help; exit 0 ;;
@@ -891,26 +1058,63 @@ main() {
 
   [[ $# -eq 0 ]] && { cmd_help; exit 1; }
 
-  local cmd="$1"
+  local cmd="$1" a
   shift
 
+  # Reject unknown commands before any nix complaint (nicer on a fresh
+  # machine: the typo error, not the nix error).
   case "$cmd" in
-    search|S)              cmd_search "$@" ;;
-    install|i)             cmd_install "$@" ;;
-    remove|uninstall|rm)   cmd_remove "$@" ;;
+    search|S|install|i|remove|uninstall|rm|list|ls|Q|list-derivations|ld|\
+    update|u|upgrade|U|shell|s|info|I|apps|restart-menu|refresh|\
+    generations|gens|prune|version|--version|-V|help|--help|-h) ;;
+    *) die "Unknown command: $cmd. Run 'nixpm help' for usage." ;;
+  esac
+
+  # Global flags are honoured on EITHER side of the subcommand: strip
+  # --no-restart from the remaining argv so it is never mistaken for a
+  # package name ('nixpm install hello --no-restart' used to try to install
+  # '--no-restart'). Command-specific flags (prune's --gc) stay untouched.
+  local args=()
+  for a in "$@"; do
+    if [[ "$a" == "--no-restart" ]]; then
+      NIXPM_RESTART_MENU="false"
+    else
+      args+=("$a")
+    fi
+  done
+
+  # Nix preflight: help/version work everywhere, even on a machine that has
+  # no nix yet (R1 — this is the stranger's first command). Everything else
+  # passes the SAME guard, exactly once, here — never inside a command.
+  # Two separate err calls on purpose: the message prints through printf
+  # "%s", so a "\n" written inside one string would show literally.
+  case "$cmd" in
+    help|--help|-h|version|--version|-V) ;;
+    *)
+      if ! has_cmd nix; then
+        err "Nix is not installed or not on PATH."
+        err "See https://nixos.org/download/"
+        exit 1
+      fi
+      ;;
+  esac
+
+  case "$cmd" in
+    search|S)              cmd_search ${args[@]+"${args[@]}"} ;;
+    install|i)             cmd_install ${args[@]+"${args[@]}"} ;;
+    remove|uninstall|rm)   cmd_remove ${args[@]+"${args[@]}"} ;;
     list|ls|Q)             cmd_list ;;
     list-derivations|ld)   cmd_list_derivations ;;
     update|u)              cmd_update ;;
-    upgrade|U)             cmd_upgrade "$@" ;;
-    shell|s)               cmd_shell "$@" ;;
-    info|I)                cmd_info "$@" ;;
+    upgrade|U)             cmd_upgrade ${args[@]+"${args[@]}"} ;;
+    shell|s)               cmd_shell ${args[@]+"${args[@]}"} ;;
+    info|I)                cmd_info ${args[@]+"${args[@]}"} ;;
     apps)                  cmd_apps ;;
     restart-menu|refresh)  cmd_restart_menu ;;
     generations|gens)      cmd_generations ;;
-    prune)                 cmd_prune "$@" ;;
+    prune)                 cmd_prune ${args[@]+"${args[@]}"} ;;
     version|--version|-V)  cmd_version ;;
     help|--help|-h)        cmd_help ;;
-    *)                     die "Unknown command: $cmd. Run 'nixpm help' for usage." ;;
   esac
 }
 

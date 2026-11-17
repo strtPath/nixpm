@@ -11,10 +11,11 @@ DESTDIR="${PREFIX:-${HOME}/.local}/bin"
 main() {
   echo "==> Installing nixpm..."
 
+  # Do NOT abort when nix is missing (R8): nixpm installs fine without it and
+  # its own preflight self-reports at first use. This pointer is a courtesy.
   if ! command -v nix >/dev/null 2>&1; then
-    echo "=> Nix is not installed."
-    echo "   Install Nix first: https://nixos.org/download/"
-    exit 1
+    echo "=> Warning: Nix is not installed yet; nixpm will report this at first use."
+    echo "   Install Nix: https://nixos.org/download/"
   fi
 
   mkdir -p "$DESTDIR"
