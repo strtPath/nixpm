@@ -35,6 +35,13 @@ Small machines can no longer be bricked by nixpm's own good intentions.
 - nixpm now says so at startup if it meets bash 3 (macOS default),
   rather than dying inside `mapfile`.
 
+One caveat about the memory guard: it protects the **cold-cache** case.
+A machine whose `~/.cache/nix` is already warm can finish the same
+whole-package-set eval in seconds — the guard cannot tell the two
+apart and refuses anyway. Anyone verifying guard behaviour on a small
+machine must start from an empty eval cache, or the run certifies
+nothing.
+
 ## v0.3.0
 
 Initial single-file CLI: pacman-flavoured commands, local search index,
