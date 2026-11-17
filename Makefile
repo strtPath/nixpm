@@ -16,11 +16,11 @@ uninstall:
 
 test:
 	@bash -n bin/nixpm
-	@echo "Syntax OK"
+	@bash tests/run.sh
 
 lint: test
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck bin/nixpm; \
+		shellcheck bin/nixpm scripts/install.sh tests/run.sh; \
 	else \
 		echo "shellcheck not installed, skipping"; \
 	fi

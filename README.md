@@ -28,6 +28,19 @@ A tiny, friendly package-manager wrapper around [Nix](https://nixos.org/). Inspi
 curl -fsSL https://raw.githubusercontent.com/strtPath/nixpm/main/scripts/install.sh | bash
 ```
 
+`main` is the release line — that URL always serves the latest tagged nixpm.
+
+### First time on plain Linux (not NixOS)
+
+Nix itself needs `/nix` to exist before its installer will run unattended:
+
+```bash
+sudo mkdir -m 0755 /nix && sudo chown "$USER" /nix
+```
+
+(Installing Nix via its interactive installer does this for you. Skip this
+section if Nix already works on your machine.)
+
 ### Manual
 
 ```bash

@@ -21,10 +21,13 @@ jobs:
       - name: Run ShellCheck
         run: |
           shellcheck --version
-          shellcheck bin/nixpm scripts/install.sh
+          shellcheck bin/nixpm scripts/install.sh tests/run.sh
 
       - name: Bash syntax check
         run: |
           bash -n bin/nixpm
           bash -n scripts/install.sh
           echo "Syntax OK"
+
+      - name: Unit tests (shimmed nix, no network)
+        run: bash tests/run.sh
