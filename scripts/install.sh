@@ -21,10 +21,10 @@ main() {
   mkdir -p "$DESTDIR"
 
   # curl pins the protocol so a redirect can't downgrade to plain HTTP (a
-  # MITM vector for code that runs as the user). GNU wget has no equivalent
-  # flag (--https-only is wget2-only and GNU wget would die on it), so the
-  # wget fallback relies on the https:// URL itself — honest limitation,
-  # curl is the primary path.
+  # MITM vector for code that runs as the user). wget offers no equivalent:
+  # its --https-only only governs link following in recursive mode and does
+  # nothing on a single-URL fetch, so the fallback relies on the https://
+  # URL itself. curl is the primary path on essentially every target.
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL --proto '=https' --tlsv1.2 "$RAW" -o "$DESTDIR/nixpm"
   elif command -v wget >/dev/null 2>&1; then
