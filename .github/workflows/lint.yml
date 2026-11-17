@@ -21,7 +21,7 @@ jobs:
       - name: Run ShellCheck
         run: |
           shellcheck --version
-          shellcheck bin/nixpm scripts/install.sh
+          shellcheck bin/nixpm scripts/install.sh tests/run.sh
 
       - name: Bash syntax check
         run: |

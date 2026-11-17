@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091,SC2034,SC1003,SC2015  # dynamic source, helper-only vars, backslash test strings, ck()'s A&&B||C idiom
 # nixpm unit checks against the working-tree bin/nixpm — host-runnable, no
 # network, no real nix touched: PATH shims log every nix call, a coreutils
 # symlink farm provides a no-nix PATH, fake meminfo/cgroup files drive the
@@ -151,6 +152,18 @@ ck "$rc" 0 "stale index served: rc=0"
 printf '%s' "$r" | grep -q 'libc' && ck ok ok "stale results still printed" || ck "$r" "libc" "stale results"
 printf '%s' "$r" | grep -qi 'stale' && ck ok ok "staleness warned" || ck "$r" "stale-warn" "stale warning"
 grep -q 'nix' "$TMP/log" && ck "$(cat "$TMP/log")" "silent" "stale path called nix anyway" || ck ok ok "stale path zero nix calls"
+rm -f "$NIXPM_SEARCH_CACHE_DIR/nixpkgs-search"
+
+step "--rebuild on low-RAM box refuses (rc=3), never substitutes stale"
+# Senior probe: an explicit --rebuild must not be quietly answered with the
+# stale index (that reported rc=0/1 as if the rebuild happened). It has to
+# surface the gate refusal.
+printf '* libc\n  The aXb C library\n' > "$NIXPM_SEARCH_CACHE_DIR/nixpkgs-search"
+: > "$TMP/log"
+r="$(run "$TMP/shim:$NONIXPATH" search --rebuild libc 2>&1)"; rc=$?
+ck "$rc" 3 "--rebuild gated on small mem: rc=3"
+grep -q 'nix' "$TMP/log" && ck "$(cat "$TMP/log")" "silent" "--rebuild refusal called nix" || ck ok ok "--rebuild refusal zero nix calls"
+printf '%s' "$r" | grep -q '^\* libc' && ck "$r" "no-stale-serve" "--rebuild served stale results" || ck ok ok "--rebuild refused rather than serving stale"
 rm -f "$NIXPM_SEARCH_CACHE_DIR/nixpkgs-search"
 
 step "CLI: warm index fast path + R4 through CLI"

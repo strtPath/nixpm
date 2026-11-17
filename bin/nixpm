@@ -507,7 +507,9 @@ cmd_search() {
     # worth serving — results may be outdated, which beats nothing. Without
     # this, a low-RAM machine that was seeded on a bigger one (or before a
     # resize) can never search at all once its index crosses the TTL.
-    if [[ -f "$(_search_index_path)" ]]; then
+    # An explicit --rebuild is exempt: silently serving stale results after
+    # the user asked for a fresh index would be a lie — refuse with rc=3.
+    if [[ $rebuild -eq 0 ]] && [[ -f "$(_search_index_path)" ]]; then
       warn "Cannot rebuild the search index here; using the stale index on disk (results may be outdated — rebuild on a bigger machine or with NIXPM_MIN_INDEX_MEM_MB=0)."
       local stale_hits src_rc=0
       stale_hits="$(_search_cache_grep "$query" "$(_search_index_path)" 2>/dev/null)" || src_rc=$?

@@ -20,12 +20,15 @@ main() {
 
   mkdir -p "$DESTDIR"
 
-  # Protocol pinned: this script downloads code that runs as the user, so a
-  # network fluke downgrading to plain HTTP is a MITM vector — https required.
+  # curl pins the protocol so a redirect can't downgrade to plain HTTP (a
+  # MITM vector for code that runs as the user). GNU wget has no equivalent
+  # flag (--https-only is wget2-only and GNU wget would die on it), so the
+  # wget fallback relies on the https:// URL itself — honest limitation,
+  # curl is the primary path.
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL --proto '=https' --tlsv1.2 "$RAW" -o "$DESTDIR/nixpm"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q --https-only "$RAW" -O "$DESTDIR/nixpm"
+    wget -q "$RAW" -O "$DESTDIR/nixpm"
   else
     echo "=> Neither curl nor wget found. Install one and try again."
     exit 1
