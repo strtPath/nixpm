@@ -27,6 +27,11 @@ Small machines can no longer be bricked by nixpm's own good intentions.
   preflight reports that at first use instead.
 - Long index builds print a heartbeat every 10 seconds so you know
   nothing has hung.
+- A low-RAM machine that already has an index keeps searching it (with
+  a staleness warning) instead of being locked out of `search` entirely.
+- `search --rebuild` forces a fresh index when you want one.
+- `install.sh` pins its download to HTTPS (a downgrade on a flaky
+  network is a MITM vector for a script that runs as you).
 - nixpm now says so at startup if it meets bash 3 (macOS default),
   rather than dying inside `mapfile`.
 

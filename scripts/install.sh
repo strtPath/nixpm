@@ -20,10 +20,12 @@ main() {
 
   mkdir -p "$DESTDIR"
 
+  # Protocol pinned: this script downloads code that runs as the user, so a
+  # network fluke downgrading to plain HTTP is a MITM vector — https required.
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$RAW" -o "$DESTDIR/nixpm"
+    curl -fsSL --proto '=https' --tlsv1.2 "$RAW" -o "$DESTDIR/nixpm"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q "$RAW" -O "$DESTDIR/nixpm"
+    wget -q --https-only "$RAW" -O "$DESTDIR/nixpm"
   else
     echo "=> Neither curl nor wget found. Install one and try again."
     exit 1

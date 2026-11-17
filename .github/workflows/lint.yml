@@ -28,3 +28,6 @@ jobs:
           bash -n bin/nixpm
           bash -n scripts/install.sh
           echo "Syntax OK"
+
+      - name: Unit tests (shimmed nix, no network)
+        run: bash tests/run.sh
