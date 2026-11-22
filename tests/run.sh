@@ -28,7 +28,7 @@ printf 'MemTotal:        8000000 kB\nMemAvailable:    3000000 kB\n' > "$TMP/mi_a
 # no-nix PATH: symlink farm of the externals nixpm shells out to, minus nix.
 mkdir -p "$TMP/corebin"
 for t in cat date stat mktemp awk sed grep sort tr head tail sleep find \
-         basename cut wc rm mv mkdir touch ln cp tee; do
+         basename cut wc rm mv mkdir touch ln cp tee chmod sha256sum; do
   ln -s "$(command -v "$t")" "$TMP/corebin/$t"
 done
 NONIXPATH="$TMP/corebin"
@@ -222,6 +222,50 @@ grep -q 'hello' "$TMP/log" && ck ok ok "install ran with hello" || ck "$(cat "$T
 : > "$TMP/log"
 run "$TMP/shim:$NONIXPATH" install --no-restart hello >"$TMP/i2" 2>&1
 grep -q -- '--no-restart' "$TMP/log" && ck "$(cat "$TMP/log")" "stripped" "pre-spelling flag leaked" || ck ok ok "install --no-restart hello: flag stripped"
+
+# ---------- installer units (scripts/install.sh; shimmed curl, no network) ----------
+# Issues #8 and #9: the installer must fetch the release assets, stage the
+# payload to a temp file inside DESTDIR, and verify SHA256SUMS before it can
+# land on PATH. The shim curl answers only the two release-asset URLs.
+step "installer: stages and checksum-verifies the release asset (#8, #9)"
+mkdir -p "$TMP/rel"
+printf '#!/bin/bash\necho payload\n' > "$TMP/rel/payload"
+sha256sum "$TMP/rel/payload" | awk '{print $1 "  nixpm"}' > "$TMP/rel/sums"
+cat > "$TMP/shim/curl" <<EOF
+#!/bin/bash
+# Fake the release endpoints: the URL picks the fixture, -o the destination.
+out=""; url=""; pending=0
+for a in "\$@"; do
+  if [[ \$pending -eq 1 ]]; then out="\$a"; pending=0; continue; fi
+  if [[ "\$a" == "-o" ]]; then pending=1; continue; fi
+  [[ "\$a" == https:* ]] && url="\$a"
+done
+echo "\$url" >> "$TMP/curllog"
+case "\$url" in
+  */nixpm)      cp "$TMP/rel/payload" "\$out" ;;
+  */SHA256SUMS) cp "$TMP/rel/sums" "\$out" ;;
+  *) exit 22 ;;
+esac
+EOF
+chmod +x "$TMP/shim/curl"
+runinstall(){ PATH="$TMP/shim:$TMP/corebin" PREFIX="$TMP/pfx" "$BASH" "$REPO/scripts/install.sh" >"$TMP/ins.out" 2>&1; }
+
+: > "$TMP/curllog"
+runinstall; rc=$?
+ck "$rc" 0 "install rc=0"
+grep -qF 'https://github.com/strtPath/nixpm/releases/latest/download/nixpm' "$TMP/curllog" \
+  && grep -qF 'SHA256SUMS' "$TMP/curllog" && ck ok ok "fetched release assets" || ck "$(cat "$TMP/curllog")" "release-urls" "release assets"
+grep -q 'raw.githubusercontent' "$TMP/curllog" && ck "$(cat "$TMP/curllog")" "no-main-head" "no fetch from main head" || ck ok ok "no fetch from main head"
+cmp -s "$TMP/rel/payload" "$TMP/pfx/bin/nixpm" && ck ok ok "installed bytes match release payload" || ck miss ok "payload bytes"
+[[ "$(find "$TMP/pfx/bin" -name '.nixpm-install.*' | wc -l)" == 0 ]] && ck ok ok "staging dir cleaned" || ck leftovers clean "staging cleaned"
+
+step "installer refuses a payload that fails SHA256SUMS, leaves nothing"
+printf '#!/bin/bash\necho tampered\n' > "$TMP/rel/payload"
+rm -rf "$TMP/pfx"
+runinstall; rc=$?
+[[ $rc -ne 0 ]] && ck nonzero nonzero "tampered payload refused (rc=$rc)" || ck "$rc" "nonzero" "tamper refused"
+[[ ! -e "$TMP/pfx/bin/nixpm" ]] && ck ok ok "nothing on PATH after refusal" || ck present absent "no partial install"
+[[ "$(find "$TMP/pfx/bin" -name '.nixpm-install.*' | wc -l)" == 0 ]] && ck ok ok "staging cleaned after refusal" || ck leftovers clean "staging cleaned after refusal"
 
 step "R10 bash guard present"
 grep -q 'requires bash >= 4' "$NIXPM" && ck ok ok "startup guard present" || ck miss ok "guard"
