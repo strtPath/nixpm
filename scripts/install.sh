@@ -8,8 +8,26 @@ set -euo pipefail
 # The v0.3.1 release ships bin/nixpm and SHA256SUMS as release assets, so the
 # installer pins to the latest release instead of main's head. One push to
 # main can no longer change what this script installs.
-REL="https://github.com/strtPath/nixpm/releases/latest/download"
+BASE="https://github.com/strtPath/nixpm/releases"
 DESTDIR="${PREFIX:-${HOME}/.local}/bin"
+
+# Resolve the latest release tag once, then fetch both assets from that tag.
+# Two separate releases/latest requests could straddle a publish and pair
+# one release's checksums with the next release's payload.
+latest_tag() {
+  # gsub strips the CR from CRLF header lines, or the tag fails sanitizing.
+  local loc
+  if command -v curl >/dev/null 2>&1; then
+    loc="$(curl -fsSI "$BASE/latest" | awk 'tolower($1)=="location:"{v=$2} END{gsub(/\r/,"",v); print v}')"
+  else
+    loc="$(wget -q --spider --server-response "$BASE/latest" 2>&1 \
+      | awk 'tolower($1)=="location:"{v=$2} END{gsub(/\r/,"",v); print v}')"
+  fi
+  case "$loc" in
+    */releases/tag/*) printf '%s\n' "${loc##*/}" ;;
+    *) return 1 ;;
+  esac
+}
 
 main() {
   echo "==> Installing nixpm..."
@@ -42,6 +60,15 @@ main() {
   # executable nixpm on PATH: it only lands once complete and verified.
   WORK="$(mktemp -d "$DESTDIR/.nixpm-install.XXXXXX")"
   trap 'rm -rf "$WORK"' EXIT
+
+  # Both assets then come from the same tag, so a publish mid-install can
+  # never mix two releases. A tag we cannot sanity-check means no install.
+  TAG="$(latest_tag || true)"
+  case "$TAG" in '' | *[!A-Za-z0-9._+-]*)
+    echo "=> Could not resolve the latest release tag; refusing to guess."
+    exit 1 ;;
+  esac
+  REL="$BASE/download/$TAG"
 
   # Checksums first: a release missing its SHA256SUMS asset fails before the
   # payload is even fetched.
