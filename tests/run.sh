@@ -28,7 +28,7 @@ printf 'MemTotal:        8000000 kB\nMemAvailable:    3000000 kB\n' > "$TMP/mi_a
 # no-nix PATH: symlink farm of the externals nixpm shells out to, minus nix.
 mkdir -p "$TMP/corebin"
 for t in cat date stat mktemp awk sed grep sort tr head tail sleep find \
-         basename cut wc rm mv mkdir touch ln cp tee; do
+         basename cut wc rm mv mkdir touch ln cp tee chmod sha256sum; do
   ln -s "$(command -v "$t")" "$TMP/corebin/$t"
 done
 NONIXPATH="$TMP/corebin"
@@ -222,6 +222,80 @@ grep -q 'hello' "$TMP/log" && ck ok ok "install ran with hello" || ck "$(cat "$T
 : > "$TMP/log"
 run "$TMP/shim:$NONIXPATH" install --no-restart hello >"$TMP/i2" 2>&1
 grep -q -- '--no-restart' "$TMP/log" && ck "$(cat "$TMP/log")" "stripped" "pre-spelling flag leaked" || ck ok ok "install --no-restart hello: flag stripped"
+
+# ---------- installer units (scripts/install.sh; shimmed curl, no network) ----------
+# Issues #8 and #9: the installer must fetch the release assets, stage the
+# payload to a temp file inside DESTDIR, and verify SHA256SUMS before it can
+# land on PATH. The shim curl answers only the two release-asset URLs.
+step "installer: stages and checksum-verifies the release asset (#8, #9)"
+mkdir -p "$TMP/rel"
+printf '#!/bin/bash\necho payload\n' > "$TMP/rel/payload"
+sha256sum "$TMP/rel/payload" | awk '{print $1 "  nixpm"}' > "$TMP/rel/sums"
+cat > "$TMP/shim/curl" <<EOF
+#!/bin/bash
+# Fake the release endpoints: the URL picks the fixture, -o the destination.
+out=""; url=""; pending=0
+for a in "\$@"; do
+  if [[ \$pending -eq 1 ]]; then out="\$a"; pending=0; continue; fi
+  if [[ "\$a" == "-o" ]]; then pending=1; continue; fi
+  [[ "\$a" == https:* ]] && url="\$a"
+done
+echo "\$url" >> "$TMP/curllog"
+case "\$url" in
+  */releases/latest) printf 'Location: https://github.com/strtPath/nixpm/releases/tag/v0.0.0-test\r\n' ;;
+  */nixpm)      cp "$TMP/rel/payload" "\$out" ;;
+  */SHA256SUMS) cp "$TMP/rel/sums" "\$out" ;;
+  *) exit 22 ;;
+esac
+EOF
+chmod +x "$TMP/shim/curl"
+runinstall(){ PATH="$TMP/shim:$TMP/corebin" PREFIX="$TMP/pfx" "$BASH" "$REPO/scripts/install.sh" >"$TMP/ins.out" 2>&1; }
+
+: > "$TMP/curllog"
+runinstall; rc=$?
+ck "$rc" 0 "install rc=0"
+grep -qF '/releases/download/v0.0.0-test/nixpm' "$TMP/curllog" \
+  && grep -qF '/releases/download/v0.0.0-test/SHA256SUMS' "$TMP/curllog" \
+  && ck ok ok "both assets fetched from one resolved tag" || ck "$(cat "$TMP/curllog")" "tagged-urls" "tagged assets"
+[[ "$(grep -c '/releases/latest$' "$TMP/curllog")" == 1 ]] && ck ok ok "tag resolved exactly once" || ck "$(cat "$TMP/curllog")" "one-resolution" "single resolution"
+grep -q 'raw.githubusercontent' "$TMP/curllog" && ck "$(cat "$TMP/curllog")" "no-main-head" "no fetch from main head" || ck ok ok "no fetch from main head"
+cmp -s "$TMP/rel/payload" "$TMP/pfx/bin/nixpm" && ck ok ok "installed bytes match release payload" || ck miss ok "payload bytes"
+[[ "$(find "$TMP/pfx/bin" -name '.nixpm-install.*' | wc -l)" == 0 ]] && ck ok ok "staging dir cleaned" || ck leftovers clean "staging cleaned"
+
+step "installer refuses a payload that fails SHA256SUMS, leaves nothing"
+printf '#!/bin/bash\necho tampered\n' > "$TMP/rel/payload"
+rm -rf "$TMP/pfx"
+runinstall; rc=$?
+[[ $rc -ne 0 ]] && ck nonzero nonzero "tampered payload refused (rc=$rc)" || ck "$rc" "nonzero" "tamper refused"
+[[ ! -e "$TMP/pfx/bin/nixpm" ]] && ck ok ok "nothing on PATH after refusal" || ck present absent "no partial install"
+[[ "$(find "$TMP/pfx/bin" -name '.nixpm-install.*' | wc -l)" == 0 ]] && ck ok ok "staging cleaned after refusal" || ck leftovers clean "staging cleaned after refusal"
+
+step "installer checksum paths: shasum fallback, and neither tool refuses"
+# Greptile #2: sha256sum is always present in the farm, so the shasum branch
+# (macOS) and the no-tool refusal never ran. nosum is the farm minus
+# sha256sum; the shasum shim delegates to the real host tool by absolute
+# path so only install.sh's branch selection changes.
+mkdir -p "$TMP/nosum"
+for l in "$TMP/corebin"/*; do
+  [[ "${l##*/}" == sha256sum ]] || ln -s "$l" "$TMP/nosum/"
+done
+printf '#!/bin/bash\necho payload\n' > "$TMP/rel/payload"
+cat > "$TMP/shim/shasum" <<EOF
+#!/bin/bash
+[[ "\${1:-}" == "-a" ]] && shift 2
+exec "$(command -v sha256sum)" "\$@"
+EOF
+chmod +x "$TMP/shim/shasum"
+rm -rf "$TMP/pfx"
+PATH="$TMP/shim:$TMP/nosum" PREFIX="$TMP/pfx" "$BASH" "$REPO/scripts/install.sh" >"$TMP/i2.out" 2>&1; rc=$?
+ck "$rc" 0 "shasum fallback installs (rc=$rc)"
+cmp -s "$TMP/rel/payload" "$TMP/pfx/bin/nixpm" && ck ok ok "shasum path bytes match" || ck miss ok "shasum bytes"
+rm -f "$TMP/shim/shasum"
+rm -rf "$TMP/pfx"
+PATH="$TMP/shim:$TMP/nosum" PREFIX="$TMP/pfx" "$BASH" "$REPO/scripts/install.sh" >"$TMP/i3.out" 2>&1; rc=$?
+[[ $rc -ne 0 ]] && ck nonzero nonzero "no checksum tool refuses (rc=$rc)" || ck "$rc" "nonzero" "no-tool refusal"
+grep -qi 'refusing' "$TMP/i3.out" && ck ok ok "refusal explains itself" || ck "$(cat "$TMP/i3.out")" "refusal-msg" "refusal message"
+[[ ! -e "$TMP/pfx/bin/nixpm" ]] && ck ok ok "nothing installed without a checksum tool" || ck present absent "no-tool partial"
 
 step "R10 bash guard present"
 grep -q 'requires bash >= 4' "$NIXPM" && ck ok ok "startup guard present" || ck miss ok "guard"
