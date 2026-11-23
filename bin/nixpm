@@ -1081,10 +1081,10 @@ ${C_B}Notes:${C_RST}
     until the index goes stale. "nixpm update" refreshes packages but does
     not rebuild the search index.
   * Search queries are literal strings, not regular expressions.
-  * On machines with less than ~6GB RAM, the first "search" and a full
-    "upgrade" refuse to run (they evaluate the entire package set and can
-    freeze small machines). Install or upgrade single packages by name —
-    that never evaluates the full set.
+  * On machines with less than ~6GB RAM, the first "search", a full
+    "upgrade", and "info" refuse to run (they evaluate the entire
+    package set and can freeze small machines). Install or upgrade
+    single packages by name — that never evaluates the full set.
   * Exit codes: 0 = success, 1 = failure / no match,
     3 = cannot run (e.g. the low-RAM guard refused a full evaluation).
 

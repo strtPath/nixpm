@@ -118,6 +118,7 @@ r="$(run "$NONIXPATH" --version 2>&1)"; rc=$?
 ck "$rc|$(printf '%s' "$r" | grep -c 'nixpm 0.3.1')" "0|1" "--version works with no nix (R1)"
 r="$(run "$NONIXPATH" help 2>&1)"; rc=$?
 ck "$rc" 0 "help works with no nix (R1)"
+printf '%s' "$r" | grep -q '"info" refuse' && ck ok ok "help low-RAM note names info (#12 review)" || ck miss ok "help names info"
 r="$(run "$NONIXPATH" install x 2>&1)"; rc=$?
 printf '%s' "$r" | grep -qF '\n' && haslit=yes || haslit=no
 ck "$rc/$haslit" "1/no" "install w/o nix: rc=1, no literal backslash-n (R2)"
