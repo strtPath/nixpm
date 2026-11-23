@@ -181,8 +181,9 @@ _nix_x() {
 # ---------------------------------------------------------------------------
 # Full-evaluation RAM gate (R3)
 #
-# Two nixpm operations evaluate the ENTIRE nixpkgs package set: the cold
-# search index build, and the full `nix-env -u` upgrade scan. On machines
+# Three nixpm operations evaluate the ENTIRE nixpkgs package set: the cold
+# search index build, the full `nix-env -u` upgrade scan, and `info`'s
+# metadata eval (nix resolves one attr through the whole set). On machines
 # below roughly 6GB that is not slow — it is fatal (observed on a clean 4GB
 # container: load 21, ssh dead, hypervisor reset needed). These commands
 # refuse below NIXPM_MIN_INDEX_MEM_MB; everything else (install/remove/list
@@ -795,6 +796,14 @@ cmd_info() {
   local pkg
   pkg="${1:-}"
   [[ -z "$pkg" ]] && die "Usage: nixpm info <pkg>"
+  # Resolving one package goes through the same whole-package-set evaluation
+  # the search and upgrade gates cover (issue #7): `nix eval '<nixpkgs>#pkg.meta'`
+  # evaluates the top-level set before picking the attr, the channel-import
+  # fallback evaluates it again, and the last-resort `nix-env -qaA` resolves
+  # against the whole set too. Gate the command up front so a small machine
+  # never reaches any of them.
+  _full_eval_gate "package info (nix evaluates the whole package set to resolve one package)" \
+      || exit 3
   out "Metadata for ${C_B}${pkg}${C_RST}:"
 
   local meta="" errfile

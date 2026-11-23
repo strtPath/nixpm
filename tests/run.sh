@@ -140,6 +140,14 @@ r="$(run "$TMP/shim:$NONIXPATH" upgrade hello 2>&1)"; rc=$?
 ck "$rc" 0 "targeted upgrade stays ungated (R11)"
 grep -q 'nix-env -u hello' "$TMP/log" && ck ok ok "targeted upgrade ran nix-env -u hello" || ck "$(cat "$TMP/log")" "nix-env -u hello" "targeted cmd"
 
+step "CLI: R3 gate on info (#7, shimmed nix, fake small mem)"
+: > "$TMP/log"
+r="$(run "$TMP/shim:$NONIXPATH" info hello 2>&1)"; rc=$?
+ck "$rc" 3 "info on small mem: rc=3 (#7)"
+grep -q 'nix' "$TMP/log" && ck "$(cat "$TMP/log")" "silent" "info refusal called nix anyway (#7)" || ck ok ok "info refusal ran ZERO nix calls (#7)"
+grep -q 'Low-RAM' <<<"$r" && ck ok ok "info shows low-RAM notice" || ck "$r" "notice" "info notice text"
+grep -q 'install <name>' <<<"$r" && ck ok ok "info refusal points at install-by-name" || ck "$r" "install-hint" "info hint points at install"
+
 step "stale index served on low-RAM box (no rebuild, no eval)"
 # Same small-mem box, but an index exists on disk (seeded on a bigger box,
 # then crossed the TTL). Refusing entirely would make it unsearchable
@@ -189,6 +197,13 @@ r="$(run "$TMP/shim:$NONIXPATH" search --rebuild libc 2>&1)"; rc=$?
 ck "$rc" 0 "--rebuild rc=0"
 grep -q 'nix .*search' "$TMP/log" && ck ok ok "--rebuild called nix search" || ck "$(cat "$TMP/log")" "search-call" "--rebuild forces eval"
 printf '%s' "$r" | grep -q 'libc' && ck ok ok "--rebuild result served from new index" || ck "$r" "libc" "--rebuild result"
+
+step "info runs ungated on a big machine (#7, positive control)"
+: > "$TMP/log"
+r="$(run "$TMP/shim:$NONIXPATH" info hello 2>&1)"; rc=$?
+ck "$rc" 1 "big-mem info reaches not-found (gate passed, shims return empty)"
+grep -q 'eval --json' "$TMP/log" && ck ok ok "big-mem info reached nix eval" || ck "$(cat "$TMP/log")" "nix-eval-call" "big-mem info reached nix"
+grep -qi 'Low-RAM' <<<"$r" && ck "$r" "no-notice" "big-mem info showed a low-RAM notice" || ck ok ok "big-mem info never sees the gate"
 
 step "R5 apps multi-output (shim)"
 mkdir -p "$TMP/fakebin/share/applications"; : > "$TMP/fakebin/share/applications/geany.desktop"
